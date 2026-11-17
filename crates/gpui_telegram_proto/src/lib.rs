@@ -1,3 +1,4 @@
+pub mod browser_contracts;
 pub mod cards;
 pub mod computer_contracts;
 pub mod contracts;
@@ -7,9 +8,11 @@ pub mod miniapp_contracts;
 pub mod semantic_tree;
 pub mod sync;
 pub mod tailnet_contracts;
+#[cfg(feature = "host")]
 pub mod tdrp;
 pub mod ws;
 
+pub use browser_contracts::*;
 pub use cards::{
     CardActionButton, CardActionType, GenerativeCard, GenerativeCardLayout, GenerativeComponent,
     InvoiceCard, PaymentStatus, PollAnswer, PollCard, PollOption, PriceLine, TodoCard, TodoItem,
@@ -34,8 +37,12 @@ pub use ws::{
     SendMessageRequest, WsClientFrame, WsServerFrame,
 };
 
+#[cfg(feature = "host")]
 pub mod api;
+#[cfg(feature = "host")]
 pub use api::*;
 
+#[cfg(feature = "host")]
 pub mod payments;
+#[cfg(feature = "host")]
 pub use payments::*;

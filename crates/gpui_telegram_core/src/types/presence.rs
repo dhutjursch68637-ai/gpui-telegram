@@ -21,7 +21,7 @@ impl UserStatus {
 
     pub fn online_for_duration(dur: Duration) -> Self {
         Self::Online {
-            expires_at: Utc::now() + dur,
+            expires_at: crate::types::now_utc_or_epoch() + dur,
         }
     }
 

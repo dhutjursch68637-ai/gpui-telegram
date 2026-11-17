@@ -14,7 +14,7 @@ pub struct DeleteTombstone {
 
 impl DeleteTombstone {
     pub fn new(chat_id: PeerId, message_ids: Vec<MessageId>, for_everyone: bool) -> Self {
-        let now = Utc::now();
+        let now = gpui_telegram_core::types::now_utc_or_epoch();
         Self {
             chat_id,
             message_ids,

@@ -1,0 +1,19 @@
+{
+  "name": "gpui-telegram-e2e-tests",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types src/runner/cli.ts",
+    "check-harness": "./run_e2e.sh --check-harness"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.0",
+    "typescript": "~5.8.3"
+  }
+}

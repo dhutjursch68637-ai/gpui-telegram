@@ -30,3 +30,29 @@ Thumbs.db
 /artifacts/
 /dist/
 /crates/gpui_telegram_server/data/
+
+# Non-root local sysroot & E2E browser/profile runs
+.local-sysroot/
+/.local-sysroot/
+.e2e-runs/
+**/.e2e-runs/
+
+# MV3 Browser Extension & Node/Playwright artifacts
+browser-extension/node_modules/
+browser-extension/dist/
+browser-extension/.vite/
+browser-extension/coverage/
+browser-extension/playwright-report/
+browser-extension/test-results/
+e2e/node_modules/
+e2e/playwright-report/
+e2e/test-results/
+**/node_modules/
+*.tsbuildinfo
+
+# Local environment & ephemeral pairing/bridge credentials
+.env
+.env.*
+!.env.example
+browser_bridge.json
+

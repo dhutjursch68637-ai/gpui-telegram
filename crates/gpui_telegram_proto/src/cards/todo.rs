@@ -109,7 +109,8 @@ impl TodoCard {
         if let Some(item) = self.items.iter_mut().find(|i| i.id == item_id) {
             item.completed = !item.completed;
             if item.completed {
-                item.completed_at_ms = Some(chrono::Utc::now().timestamp_millis());
+                item.completed_at_ms =
+                    Some(gpui_telegram_core::types::now_utc_or_epoch().timestamp_millis());
             } else {
                 item.completed_at_ms = None;
             }

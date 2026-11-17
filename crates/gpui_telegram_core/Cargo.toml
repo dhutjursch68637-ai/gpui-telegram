@@ -4,22 +4,68 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["host"]
+host = [
+    "dep:futures",
+    "dep:schemars",
+    "dep:uuid",
+    "dep:sha1",
+    "dep:aes",
+    "dep:cbc",
+    "dep:fabushi-messaging-core",
+    "dep:mahayana-node-agent-coordinator",
+    "dep:mahayana-host-runtime",
+]
+
 [dependencies]
-futures = { workspace = true }
-schemars = "1.0"
+futures = { workspace = true, optional = true }
+schemars = { version = "1.0", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, optional = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
-sha1 = { workspace = true }
+sha1 = { workspace = true, optional = true }
 subtle = "2.6"
-aes = "0.8"
-cbc = "0.1"
-fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
-mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }
-mahayana-host-runtime = { path = "../../inherited/host" }
+aes = { version = "0.8", optional = true }
+cbc = { version = "0.1", optional = true }
+fabushi-messaging-core = { path = "../../inherited/mahayana-messaging", optional = true }
+mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator", optional = true }
+mahayana-host-runtime = { path = "../../inherited/host", optional = true }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true }
+
+[[test]]
+name = "adversarial_core_stress_challenger"
+required-features = ["host"]
+
+[[test]]
+name = "adversarial_mtproto_stress_challenger"
+required-features = ["host"]
+
+[[test]]
+name = "adversarial_mtproto_tests"
+required-features = ["host"]
+
+[[test]]
+name = "adversarial_security_fuzz_tests"
+required-features = ["host"]
+
+[[test]]
+name = "inherited_linking_tests"
+required-features = ["host"]
+
+[[test]]
+name = "materialized_core_modules_tests"
+required-features = ["host"]
+
+[[test]]
+name = "passport_subsystem_tests"
+required-features = ["host"]
+
+[[test]]
+name = "test_action_bus_quad_export"
+required-features = ["host"]

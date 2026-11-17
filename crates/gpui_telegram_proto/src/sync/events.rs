@@ -34,7 +34,7 @@ impl TypingEvent {
             chat_id,
             user_id,
             action,
-            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            timestamp_ms: gpui_telegram_core::types::now_utc_or_epoch().timestamp_millis(),
         }
     }
 }

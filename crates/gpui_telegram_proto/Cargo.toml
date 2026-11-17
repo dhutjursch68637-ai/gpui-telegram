@@ -4,14 +4,52 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["host"]
+host = [
+    "gpui_telegram_core/host",
+    "dep:uuid",
+    "dep:fabushi-messaging-core",
+    "dep:mahayana-node-agent-coordinator",
+    "dep:mahayana-host-runtime",
+]
+
 [dependencies]
-gpui_telegram_core = { workspace = true }
+gpui_telegram_core = { workspace = true, default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, optional = true }
 sha2 = { workspace = true }
-fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
-mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }
-mahayana-host-runtime = { path = "../../inherited/host" }
+fabushi-messaging-core = { path = "../../inherited/mahayana-messaging", optional = true }
+mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator", optional = true }
+mahayana-host-runtime = { path = "../../inherited/host", optional = true }
+
+[[test]]
+name = "api_rpc_endpoints_tests"
+required-features = ["host"]
+
+[[test]]
+name = "challenger_module_02_fuzz_tests"
+required-features = ["host"]
+
+[[test]]
+name = "inherited_proto_linking_tests"
+required-features = ["host"]
+
+[[test]]
+name = "materialized_proto_api_tests"
+required-features = ["host"]
+
+[[test]]
+name = "module_13_adversarial_payments_tests"
+required-features = ["host"]
+
+[[test]]
+name = "payments_part1_tests"
+required-features = ["host"]
+
+[[test]]
+name = "payments_part2_tests"
+required-features = ["host"]

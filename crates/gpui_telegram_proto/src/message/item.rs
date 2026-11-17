@@ -103,7 +103,7 @@ impl MessageItem {
             sender_id,
             topic_id: None,
             flags: MessageFlags::default(),
-            date: Utc::now(),
+            date: gpui_telegram_core::types::now_utc_or_epoch(),
             edit_date: None,
             content,
             reply_to: None,

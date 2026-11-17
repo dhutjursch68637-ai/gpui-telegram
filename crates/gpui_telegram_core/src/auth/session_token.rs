@@ -35,7 +35,7 @@ impl SessionToken {
         Self {
             session_id: session_id.into(),
             user_id,
-            created_at: Utc::now(),
+            created_at: crate::types::now_utc_or_epoch(),
             expires_at,
             device_name: device_name.into(),
             token_hash: Self::hash_token(raw_token),
@@ -63,7 +63,7 @@ impl SessionToken {
 
     /// Check if session has expired against current wall-clock time
     pub fn is_expired(&self) -> bool {
-        Utc::now() >= self.expires_at
+        crate::types::now_utc_or_epoch() >= self.expires_at
     }
 
     /// Check if session is currently valid

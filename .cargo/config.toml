@@ -1,4 +1,7 @@
-# High-speed build & linker configuration for GPUI-Telegram
+# High-speed build, non-root Linux sysroot & WASM target configuration for GPUI-Telegram
+
+[build]
+target-dir = "target"
 
 [registries.crates-io]
 protocol = "sparse"
@@ -7,10 +10,25 @@ protocol = "sparse"
 retry = 3
 git-fetch-with-cli = false
 
-# Linux: clang + mold parallel linker (4.9x faster than lld, ~8x faster than GNU ld)
+[env]
+PKG_CONFIG_PATH = "/home/antigravity/.local-sysroot/usr/lib/x86_64-linux-gnu/pkgconfig:/home/antigravity/.local-sysroot/usr/share/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig:"
+CPATH = "/home/antigravity/.local-sysroot/usr/include:/home/antigravity/.local-sysroot/usr/include/libdrm"
+C_INCLUDE_PATH = "/home/antigravity/.local-sysroot/usr/include:/home/antigravity/.local-sysroot/usr/include/libdrm"
+CPLUS_INCLUDE_PATH = "/home/antigravity/.local-sysroot/usr/include:/home/antigravity/.local-sysroot/usr/include/libdrm"
+LIBRARY_PATH = "/home/antigravity/.local-sysroot/usr/lib/x86_64-linux-gnu"
+LIBCLANG_PATH = "/home/antigravity/.local-sysroot/usr/lib/llvm-14/lib"
+PROTOC = "/usr/bin/protoc"
+
+# Linux x86_64: clang + mold parallel linker + non-root sysroot lib/rpath
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = [
+  "-C", "link-arg=-B/home/antigravity/.local-sysroot/usr/bin",
+  "-C", "link-arg=-fuse-ld=mold",
+  "-L", "native=/home/antigravity/.local-sysroot/usr/lib/x86_64-linux-gnu",
+  "-C", "link-arg=-Wl,--disable-new-dtags",
+  "-C", "link-arg=-Wl,-rpath,/home/antigravity/.local-sysroot/usr/lib/x86_64-linux-gnu",
+]
 
 [target.aarch64-unknown-linux-gnu]
 linker = "clang"
@@ -22,6 +40,10 @@ rustflags = ["-C", "link-arg=-Wl,-dead_strip_dylibs"]
 
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-dead_strip_dylibs"]
+
+# WASM: pure wasm-ld linkage using overlay rust-sysroot (zero Linux linker flag pollution)
+[target.wasm32-unknown-unknown]
+rustflags = ["--sysroot=/home/antigravity/.local-sysroot/rust-sysroot"]
 
 [alias]
 dcheck = "check -p gpui_telegram_desktop --bin gpui_telegram_desktop"

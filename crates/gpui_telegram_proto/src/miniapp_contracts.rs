@@ -5,8 +5,31 @@
 //! CloudStorage quota enforcement, and companion AI bot workflows.
 
 use crate::message::InlineKeyboardButton;
+#[cfg(feature = "host")]
 pub use fabushi_messaging_core::miniapp::MiniAppPermission;
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(feature = "host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MiniAppPermission {
+    Identity,
+    Theme,
+    ClipboardRead,
+    ClipboardWrite,
+    Camera,
+    Microphone,
+    Location,
+    Contacts,
+    Files,
+    Notifications,
+    Haptics,
+    Payments,
+    OpenExternal,
+    SendMessage,
+    ReadConversation,
+    ServiceCall,
+}
 
 /// Reserved official `@BotFather` user ID (`UserId(777_001)`).
 pub const BOTFATHER_USER_ID: i64 = 777_001;

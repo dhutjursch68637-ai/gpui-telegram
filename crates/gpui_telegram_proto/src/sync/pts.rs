@@ -97,7 +97,7 @@ impl SyncGetDifferenceRequest {
             pts,
             pts_total_limit: Some(limit),
             limit,
-            date: chrono::Utc::now().timestamp(),
+            date: gpui_telegram_core::types::now_utc_or_epoch().timestamp(),
             filter: None,
         }
     }
