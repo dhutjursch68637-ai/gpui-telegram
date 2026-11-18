@@ -3,14 +3,45 @@ import {
   CANONICAL_TEST_IDS,
   LOCAL_COPILOT_CHAT_ID,
   OFFICIAL_BOT_USER_ID,
+  clampBubbleRadiusPx,
+  clampFontSizePx,
+  normalizeExtensionLocale,
+  normalizeThemePreset,
   type BrowserRunPolicy,
+  type DesktopThemePreset,
+  type ExtensionLocale,
   type ExtensionRuntimeStateSummary,
   type PendingBrowserCommandDto,
   type StoredDialogDto,
   type StoredMessageDto,
 } from '../shared/rpc_types';
 import { ensureWasmLoaded } from '../wasm/wasm_bridge';
+import { AuthWizard } from './components/AuthWizard';
+import { CallOverlay, TalkModeOverlay } from './components/CallOverlay';
+import { ChatSidebar } from './components/ChatSidebar';
+import { ContextInspector, type InspectorTabId } from './components/ContextInspector';
+import { ConversationStage } from './components/ConversationStage';
+import { HermesStudio } from './components/HermesStudio';
+import {
+  MiniAppHostModal,
+  MiniAppPickerModal,
+  type ActiveMiniAppSession,
+} from './components/MiniAppHost';
+import {
+  BrowserWorkbenchModal,
+  CreatePollModal,
+  E2eeVerifyModal,
+  ExportDataModal,
+  ForwardMessageModal,
+  ShortcutsLegendModal,
+} from './components/Modals';
+import { MainMenuDrawer, NavRail, type WorkspacePrimaryTab } from './components/NavRail';
+import { PasscodeLockScreen } from './components/PasscodeLockScreen';
+import { PopupView } from './components/PopupView';
+import { SettingsRouter, type SettingsSectionId } from './components/SettingsRouter';
+import { tr } from './i18n/translations';
 import { sendSwRpc, subscribeSwEvents } from './sw_client';
+import { applyAppearanceToDocument, getNextThemePreset, sanitizeHexColor } from './theme/palettes';
 import './styles.css';
 
 export type ExtensionSurfaceKind = 'workspace' | 'sidepanel' | 'popup' | 'options';
@@ -34,133 +65,88 @@ const DEFAULT_STATE: ExtensionRuntimeStateSummary = {
   bot_streaming: false,
   active_bot_run_id: null,
   theme_mode: 'dark',
-  language_code: 'en',
+  theme_preset: 'night',
+  font_size: 13,
+  bubble_radius: 17,
+  accent_color: '#40A7E3',
+  language_code: 'en-US',
+  passcode_enabled: false,
+  passcode_locked: false,
+  accounts: [],
+  active_account_id: null,
   wasm_ready: false,
 };
-
-const SLASH_SUGGESTIONS = [
-  '/browser status',
-  '/browser tabs',
-  '/browser snapshot',
-  '/browser screenshot',
-  '/interrupt',
-];
-
-function PendingApprovalList({
-  items,
-  onDecision,
-}: {
-  items: PendingBrowserCommandDto[];
-  onDecision: (commandId: string, approved: boolean, rememberForSession: boolean) => void;
-}) {
-  const [rememberMap, setRememberMap] = useState<Record<string, boolean>>({});
-
-  if (items.length === 0) return null;
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      {items.map((cmd) => {
-        const remember = Boolean(rememberMap[cmd.command_id]);
-        return (
-          <div
-            key={cmd.command_id}
-            className="approval-card"
-            role="alert"
-            data-testid={CANONICAL_TEST_IDS.browserApprovalCard}
-            data-command-id={cmd.command_id}
-          >
-            <div style={{ fontWeight: 700 }}>
-              {cmd.injection_flagged ? '⚠️ Escalated Security Approval: ' : '🔒 Browser Action Approval: '}
-              <code>{cmd.tool}</code>
-            </div>
-            <div style={{ fontSize: 12, marginTop: 3 }}>
-              {cmd.reason}
-              {cmd.target_url ? ` — ${cmd.target_url}` : ''}
-            </div>
-            <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 2 }}>
-              ID: {cmd.command_id} • Args: <code>{JSON.stringify(cmd.arguments)}</code>
-            </div>
-            <div className="approval-actions">
-              {!cmd.injection_flagged && (
-                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12 }}>
-                  <input
-                    type="checkbox"
-                    data-testid={CANONICAL_TEST_IDS.approvalRememberSession}
-                    checked={remember}
-                    onChange={(e) =>
-                      setRememberMap((prev) => ({
-                        ...prev,
-                        [cmd.command_id]: e.target.checked,
-                      }))
-                    }
-                  />
-                  Remember for session
-                </label>
-              )}
-              <button
-                type="button"
-                className="btn success"
-                data-testid={CANONICAL_TEST_IDS.browserApprovalApproveBtn}
-                data-action="approve"
-                onClick={() => onDecision(cmd.command_id, true, remember)}
-              >
-                Approve
-              </button>
-              {!cmd.injection_flagged && (
-                <button
-                  type="button"
-                  className="btn primary"
-                  data-testid={CANONICAL_TEST_IDS.browserApprovalSessionBtn}
-                  data-action="approve-session"
-                  onClick={() => onDecision(cmd.command_id, true, true)}
-                >
-                  Allow for Session
-                </button>
-              )}
-              <button
-                type="button"
-                className="btn danger"
-                data-testid={CANONICAL_TEST_IDS.browserApprovalDenyBtn}
-                data-action="deny"
-                onClick={() => onDecision(cmd.command_id, false, false)}
-              >
-                Deny
-              </button>
-            </div>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
 
 export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
   const [state, setState] = useState<ExtensionRuntimeStateSummary>(DEFAULT_STATE);
   const [dialogs, setDialogs] = useState<StoredDialogDto[]>([]);
   const [pendingApprovals, setPendingApprovals] = useState<PendingBrowserCommandDto[]>([]);
+  const [messagesByChat, setMessagesByChat] = useState<Record<number, StoredMessageDto[]>>({});
+
+  // Navigation & layout state
+  const [activeNavTab, setActiveNavTab] = useState<WorkspacePrimaryTab>(
+    surface === 'options' ? 'settings' : 'chats',
+  );
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId>('Overview');
   const [selectedChatId, setSelectedChatId] = useState<number>(
     surface === 'sidepanel' ? LOCAL_COPILOT_CHAT_ID : 0,
   );
-  const [messagesByChat, setMessagesByChat] = useState<Record<number, StoredMessageDto[]>>({});
-  const [activeNavTab, setActiveNavTab] = useState<'chats' | 'studio' | 'settings'>(
-    surface === 'options' ? 'settings' : 'chats',
+  const [selectedTopicId, setSelectedTopicId] = useState<number | null>(null);
+
+  const [sidebarWidth, setSidebarWidth] = useState<number>(288);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
+  const [inspectorOpen, setInspectorOpen] = useState<boolean>(
+    typeof window !== 'undefined' ? window.innerWidth >= 980 : true,
   );
-  const [studioSubTab, setStudioSubTab] = useState<'approvals' | 'overview'>('approvals');
-  const [searchQuery, setSearchQuery] = useState('');
-  const [composerText, setComposerText] = useState('');
+  const [inspectorTab, setInspectorTab] = useState<InspectorTabId | undefined>(undefined);
+  const [showArchivedDrawer, setShowArchivedDrawer] = useState<boolean>(false);
+  const [addingAccountMode, setAddingAccountMode] = useState<boolean>(false);
 
-  // Auth Wizard form state
-  const [authServerUrl, setAuthServerUrl] = useState('http://127.0.0.1:8080');
-  const [authUsername, setAuthUsername] = useState('');
-  const [authPassword, setAuthPassword] = useState('');
-  const [authError, setAuthError] = useState('');
+  // Overlays & Modals
+  const [mainMenuOpen, setMainMenuOpen] = useState<boolean>(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState<boolean>(false);
+  const [miniAppPickerOpen, setMiniAppPickerOpen] = useState<boolean>(false);
+  const [activeMiniApp, setActiveMiniApp] = useState<ActiveMiniAppSession | null>(null);
+  const [callOverlay, setCallOverlay] = useState<{ open: boolean; video: boolean }>({
+    open: false,
+    video: false,
+  });
+  const [talkModeOpen, setTalkModeOpen] = useState<boolean>(false);
+  const [pollModalOpen, setPollModalOpen] = useState<boolean>(false);
+  const [forwardMsg, setForwardMsg] = useState<StoredMessageDto | null>(null);
+  const [e2eeModalOpen, setE2eeModalOpen] = useState<boolean>(false);
+  const [shortcutsModalOpen, setShortcutsModalOpen] = useState<boolean>(false);
+  const [exportModalOpen, setExportModalOpen] = useState<boolean>(false);
+  const [browserWorkbenchOpen, setBrowserWorkbenchOpen] = useState<boolean>(false);
 
-  // Options domain config inputs
-  const [allowedDomainsText, setAllowedDomainsText] = useState('');
-  const [blockedDomainsText, setBlockedDomainsText] = useState('');
-
-  const selectedChatRef = useRef(selectedChatId);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const selectedChatRef = useRef<number>(selectedChatId);
   selectedChatRef.current = selectedChatId;
+  const msgFetchSeqRef = useRef<number>(0);
+
+  const themePreset: DesktopThemePreset = useMemo(
+    () => normalizeThemePreset(state.theme_preset, state.theme_mode),
+    [state.theme_mode, state.theme_preset],
+  );
+  const locale: ExtensionLocale = useMemo(
+    () => normalizeExtensionLocale(state.language_code),
+    [state.language_code],
+  );
+  const fontSize = clampFontSizePx(state.font_size, 13);
+  const bubbleRadius = clampBubbleRadiusPx(state.bubble_radius, 17);
+  const accentColor = sanitizeHexColor(state.accent_color, '#40A7E3');
+
+  // Synchronously apply `.tdesktop-theme`, `data-theme`, `lang`, and CSS custom properties
+  useEffect(() => {
+    applyAppearanceToDocument({
+      themePreset,
+      themeMode: state.theme_mode,
+      fontSize,
+      bubbleRadius,
+      accentColor,
+      locale,
+    });
+  }, [accentColor, bubbleRadius, fontSize, locale, state.theme_mode, themePreset]);
 
   const refreshAll = useCallback(async () => {
     const snap = await sendSwRpc<{
@@ -172,9 +158,6 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
 
     if (snap?.state) {
       setState(snap.state);
-      if (snap.state.server_url) setAuthServerUrl(snap.state.server_url);
-      setAllowedDomainsText(snap.state.allowed_domains.join(', '));
-      setBlockedDomainsText(snap.state.blocked_domains.join(', '));
     }
     if (Array.isArray(snap?.dialogs)) {
       setDialogs(snap.dialogs);
@@ -184,9 +167,48 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     }
   }, []);
 
+  // Hydrate initial appearance & sidebar width directly from chrome.storage.local for zero-flash startup
+  useEffect(() => {
+    if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+      void chrome.storage.local.get(null).then((raw) => {
+        if (!raw) return;
+        const app = raw.appearance && typeof raw.appearance === 'object' ? raw.appearance : {};
+        const initPreset = normalizeThemePreset(
+          raw.theme_preset ?? raw.theme ?? app.theme_preset,
+          raw.theme_mode ?? app.theme_mode,
+        );
+        const initLocale = normalizeExtensionLocale(
+          raw.language_code ?? raw.lang ?? raw.locale ?? app.language_code ?? 'en-US',
+        );
+        const initFont = clampFontSizePx(raw.font_size ?? app.font_size, 13);
+        const initRadius = clampBubbleRadiusPx(raw.bubble_radius ?? app.bubble_radius, 17);
+        const initAccent = sanitizeHexColor(raw.accent_color ?? app.accent_color, '#40A7E3');
+        if (typeof raw.sidebar_width === 'number') {
+          setSidebarWidth(Math.min(360, Math.max(240, Math.round(raw.sidebar_width))));
+        }
+        applyAppearanceToDocument({
+          themePreset: initPreset,
+          fontSize: initFont,
+          bubbleRadius: initRadius,
+          accentColor: initAccent,
+          locale: initLocale,
+        });
+      });
+    }
+  }, []);
+
+  // Subscribe to SW events + direct chrome.storage.onChanged cross-surface sync + viewport responsiveness
   useEffect(() => {
     void ensureWasmLoaded();
     void refreshAll();
+
+    // Support URL hash `#chat=<id>` from popup quick-switcher
+    if (typeof window !== 'undefined' && window.location.hash.startsWith('#chat=')) {
+      const parsedId = Number(window.location.hash.slice('#chat='.length));
+      if (Number.isFinite(parsedId) && parsedId !== 0) {
+        setSelectedChatId(parsedId);
+      }
+    }
 
     const unsubscribe = subscribeSwEvents((ev) => {
       if (ev.type === 'state_snapshot') {
@@ -203,6 +225,7 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
       } else if (ev.type === 'auth_expired') {
         setState((prev) => ({ ...prev, authenticated: false, user_id: null }));
         setDialogs([]);
+        setMessagesByChat({});
       } else if (ev.type === 'bot_stream_delta') {
         setState((prev) => ({ ...prev, bot_streaming: ev.streaming }));
         setMessagesByChat((prev) => {
@@ -225,31 +248,76 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
       }
     });
 
-    // Global Alt+Shift+S emergency kill-switch listener inside every Extension UI surface
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.altKey && e.shiftKey && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        void sendSwRpc({ type: 'ui.emergency_stop', reason: 'Alt+Shift+S shortcut' });
+    const onStorageChanged = (
+      changes: Record<string, chrome.storage.StorageChange>,
+      area: string,
+    ) => {
+      if (area !== 'local') return;
+      if (
+        changes.theme_preset ||
+        changes.theme ||
+        changes.theme_mode ||
+        changes.language_code ||
+        changes.lang ||
+        changes.font_size ||
+        changes.bubble_radius ||
+        changes.accent_color ||
+        changes.run_policy ||
+        changes.emergency_stopped ||
+        changes.passcode_locked ||
+        changes.active_account_id ||
+        changes.token
+      ) {
+        void refreshAll();
       }
     };
-    window.addEventListener('keydown', onKeyDown);
+    if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+      chrome.storage.onChanged.addListener(onStorageChanged);
+    }
+
+    const onResize = () => {
+      if (window.innerWidth < 980) {
+        setInspectorOpen(false);
+      } else if (window.innerWidth >= 1200) {
+        setInspectorOpen(true);
+      }
+    };
+    window.addEventListener('resize', onResize);
 
     return () => {
       unsubscribe();
-      window.removeEventListener('keydown', onKeyDown);
+      if (typeof chrome !== 'undefined' && chrome.storage?.onChanged) {
+        chrome.storage.onChanged.removeListener(onStorageChanged);
+      }
+      window.removeEventListener('resize', onResize);
     };
   }, [refreshAll]);
 
-  // Auto-select first real synced dialog in workspace mode when dialogs arrive
+  // Sync dialogs from server whenever authenticated session becomes active or account switches
   useEffect(() => {
-    if (surface === 'sidepanel') {
+    if (!state.authenticated) return;
+    void sendSwRpc<{ ok: boolean; dialogs?: StoredDialogDto[] }>({ type: 'ui.sync_dialogs' }).then(
+      (res) => {
+        if (Array.isArray(res?.dialogs)) {
+          setDialogs(res.dialogs);
+        }
+      },
+    );
+  }, [state.authenticated, state.active_account_id]);
+
+  // Auto-select initial dialog
+  useEffect(() => {
+    if (surface === 'sidepanel' || surface === 'popup') {
       if (selectedChatId === 0) {
         setSelectedChatId(LOCAL_COPILOT_CHAT_ID);
       }
       return;
     }
     if (surface === 'workspace' && selectedChatId === 0) {
-      if (dialogs.length > 0) {
+      const firstUnarchived = dialogs.find((d) => !d.is_archived);
+      if (firstUnarchived) {
+        setSelectedChatId(firstUnarchived.chat_id);
+      } else if (dialogs.length > 0) {
         setSelectedChatId(dialogs[0]!.chat_id);
       } else {
         setSelectedChatId(LOCAL_COPILOT_CHAT_ID);
@@ -257,19 +325,190 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     }
   }, [dialogs, selectedChatId, surface]);
 
-  // Load messages whenever selectedChatId changes
-  useEffect(() => {
-    if (!selectedChatId) return;
-    void sendSwRpc<{ ok: boolean; chat_id: number; messages: StoredMessageDto[] }>({
+  // Monotonic generation-guarded message loader (prevents rapid dialog switch race — T2-F12-06)
+  const loadChatMessages = useCallback(async (targetChatId: number) => {
+    if (!targetChatId) return;
+    const seq = ++msgFetchSeqRef.current;
+    const res = await sendSwRpc<{ ok: boolean; chat_id: number; messages: StoredMessageDto[] }>({
       type: 'ui.get_messages',
-      chat_id: selectedChatId,
-    }).then((res) => {
-      if (Array.isArray(res?.messages)) {
-        setMessagesByChat((prev) => ({ ...prev, [selectedChatId]: res.messages }));
-      }
+      chat_id: targetChatId,
     });
-  }, [selectedChatId]);
+    if (seq !== msgFetchSeqRef.current && selectedChatRef.current !== targetChatId) {
+      return;
+    }
+    if (Array.isArray(res?.messages)) {
+      setMessagesByChat((prev) => ({ ...prev, [targetChatId]: res.messages }));
+    }
+  }, []);
 
+  useEffect(() => {
+    if (selectedChatId !== 0) {
+      void loadChatMessages(selectedChatId);
+    }
+    if (surface === 'popup') {
+      void loadChatMessages(LOCAL_COPILOT_CHAT_ID);
+    }
+  }, [loadChatMessages, selectedChatId, surface]);
+
+  // Global Keyboard Shortcuts (`Ctrl+K`, `Ctrl+,`, `Ctrl+B`, `Ctrl+I`, `Ctrl+E`, `Ctrl+L`, `Ctrl+/`, `Alt+Shift+S`, layered `Escape`)
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.altKey && e.shiftKey && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        setState((prev) => ({
+          ...prev,
+          emergency_stopped: true,
+          run_policy: 'disabled',
+          bot_streaming: false,
+        }));
+        void sendSwRpc({ type: 'ui.emergency_stop', reason: 'Alt+Shift+S shortcut' });
+        return;
+      }
+
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && !e.altKey) {
+        const k = e.key.toLowerCase();
+        if (k === 'k') {
+          e.preventDefault();
+          setActiveNavTab('chats');
+          window.setTimeout(() => {
+            searchInputRef.current?.focus();
+            searchInputRef.current?.select();
+          }, 20);
+          return;
+        }
+        if (e.key === ',') {
+          e.preventDefault();
+          setActiveNavTab('settings');
+          return;
+        }
+        if (k === 'b' && !e.shiftKey) {
+          e.preventDefault();
+          setSidebarCollapsed((v) => !v);
+          return;
+        }
+        if (k === 'i' && !e.shiftKey) {
+          e.preventDefault();
+          setInspectorOpen((v) => !v);
+          return;
+        }
+        if (k === 'e' && !e.shiftKey) {
+          e.preventDefault();
+          setAccountMenuOpen((v) => !v);
+          return;
+        }
+        if (k === 'l' && !e.shiftKey) {
+          e.preventDefault();
+          if (state.passcode_enabled) {
+            void sendSwRpc({ type: 'ui.set_preferences', passcode_locked: true });
+          } else {
+            setActiveNavTab('settings');
+            setSettingsSection('LocalPasscode');
+          }
+          return;
+        }
+        if (e.key === '/' || e.key === '?') {
+          e.preventDefault();
+          setShortcutsModalOpen((v) => !v);
+          return;
+        }
+        if (e.key === '[' && activeNavTab === 'settings') {
+          e.preventDefault();
+          if (settingsSection !== 'Overview') {
+            setSettingsSection('Overview');
+          } else {
+            setActiveNavTab('chats');
+          }
+          return;
+        }
+      }
+
+      // Layered Escape (closes topmost modal/overlay without wiping composer draft — T1-F10-06)
+      if (e.key === 'Escape') {
+        if (activeMiniApp) {
+          e.preventDefault();
+          setActiveMiniApp(null);
+          return;
+        }
+        if (miniAppPickerOpen) {
+          e.preventDefault();
+          setMiniAppPickerOpen(false);
+          return;
+        }
+        if (callOverlay.open) {
+          e.preventDefault();
+          setCallOverlay({ open: false, video: false });
+          return;
+        }
+        if (talkModeOpen) {
+          e.preventDefault();
+          setTalkModeOpen(false);
+          return;
+        }
+        if (pollModalOpen) {
+          e.preventDefault();
+          setPollModalOpen(false);
+          return;
+        }
+        if (forwardMsg) {
+          e.preventDefault();
+          setForwardMsg(null);
+          return;
+        }
+        if (e2eeModalOpen) {
+          e.preventDefault();
+          setE2eeModalOpen(false);
+          return;
+        }
+        if (shortcutsModalOpen) {
+          e.preventDefault();
+          setShortcutsModalOpen(false);
+          return;
+        }
+        if (exportModalOpen) {
+          e.preventDefault();
+          setExportModalOpen(false);
+          return;
+        }
+        if (browserWorkbenchOpen) {
+          e.preventDefault();
+          setBrowserWorkbenchOpen(false);
+          return;
+        }
+        if (mainMenuOpen) {
+          e.preventDefault();
+          setMainMenuOpen(false);
+          return;
+        }
+        if (accountMenuOpen) {
+          e.preventDefault();
+          setAccountMenuOpen(false);
+          return;
+        }
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    accountMenuOpen,
+    activeMiniApp,
+    activeNavTab,
+    browserWorkbenchOpen,
+    callOverlay.open,
+    e2eeModalOpen,
+    exportModalOpen,
+    forwardMsg,
+    mainMenuOpen,
+    miniAppPickerOpen,
+    pollModalOpen,
+    settingsSection,
+    shortcutsModalOpen,
+    state.passcode_enabled,
+    talkModeOpen,
+  ]);
+
+  // Preference & Bridge Handlers
   const handlePolicyChange = async (nextPolicy: BrowserRunPolicy) => {
     setState((prev) => ({
       ...prev,
@@ -303,10 +542,52 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     });
   };
 
+  const handleSelectTheme = async (nextPreset: DesktopThemePreset) => {
+    setState((prev) => ({
+      ...prev,
+      theme_preset: nextPreset,
+      theme_mode: nextPreset === 'day' || nextPreset === 'classic' ? 'light' : 'dark',
+    }));
+    await sendSwRpc({ type: 'ui.set_preferences', theme_preset: nextPreset });
+  };
+
+  const handleCycleTheme = () => {
+    void handleSelectTheme(getNextThemePreset(themePreset));
+  };
+
+  const handleSelectLocale = async (nextLocale: ExtensionLocale) => {
+    setState((prev) => ({ ...prev, language_code: nextLocale }));
+    await sendSwRpc({ type: 'ui.set_preferences', language_code: nextLocale });
+  };
+
+  const handleToggleLocale = () => {
+    void handleSelectLocale(locale === 'zh-CN' ? 'en-US' : 'zh-CN');
+  };
+
+  const handleSwitchAccount = async (accountId: number | string) => {
+    setAccountMenuOpen(false);
+    setMessagesByChat({});
+    setSelectedChatId(0);
+    await sendSwRpc({ type: 'ui.switch_account', account_id: accountId });
+    await refreshAll();
+  };
+
+  const handleLogoutAccount = async (accountId?: number | string) => {
+    setAccountMenuOpen(false);
+    setMessagesByChat({});
+    setSelectedChatId(0);
+    await sendSwRpc({
+      type: 'ui.logout',
+      ...(accountId !== undefined ? { account_id: accountId } : {}),
+    });
+    await refreshAll();
+  };
+
   const handleSelectDialog = (dlg: StoredDialogDto) => {
     setSelectedChatId(dlg.chat_id);
+    setSelectedTopicId(null);
     setActiveNavTab('chats');
-    if (dlg.unread_count > 0) {
+    if (dlg.unread_count > 0 && dlg.chat_id > 0) {
       void sendSwRpc({
         type: 'ui.mark_read',
         chat_id: dlg.chat_id,
@@ -315,672 +596,559 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     }
   };
 
-  const handleSendComposer = async () => {
-    const trimmed = composerText.trim();
-    if (!trimmed) return;
-    const targetChat =
-      surface === 'sidepanel' ? LOCAL_COPILOT_CHAT_ID : selectedChatId || LOCAL_COPILOT_CHAT_ID;
-    setComposerText('');
-    await sendSwRpc({
-      type: 'ui.send_message',
-      surface,
-      chat_id: targetChat,
-      text: trimmed,
-    });
-  };
-
-  const handleStopBot = async () => {
-    await sendSwRpc({ type: 'ui.stop_bot' });
-  };
-
-  const handleAuthSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthError('');
-    const base = authServerUrl.trim().replace(/\/+$/, '');
-    const username = authUsername.trim();
-    const password = authPassword;
-    if (!base || !username || !password) {
-      setAuthError('Server URL, username, and password are required.');
-      return;
-    }
-
-    try {
-      let resp = await fetch(`${base}/api/v1/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      });
-      if (resp.status === 401 || resp.status === 404) {
-        resp = await fetch(`${base}/api/v1/auth/register`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ username, password, display_name: username }),
-        });
-      }
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => '');
-        setAuthError(`Authentication failed (${resp.status}): ${txt}`);
-        return;
-      }
-      const data = (await resp.json()) as Record<string, any>;
-      const token = String(data.token ?? data.access_token ?? '');
-      if (!token) {
-        setAuthError('Server returned empty token.');
-        return;
-      }
-      await sendSwRpc({
-        type: 'ui.login_success',
-        server_url: base,
-        token,
-        user_id: typeof data.user_id === 'number' ? data.user_id : data.user?.id ?? null,
-        username: data.username ?? data.user?.username ?? username,
-      });
-      await refreshAll();
-    } catch (err: any) {
-      setAuthError(String(err?.message ?? err));
-    }
-  };
-
-  const bridgeStatusLabel = useMemo(() => {
-    if (state.emergency_stopped || state.run_policy === 'disabled') {
-      return 'Stopped / Disabled';
-    }
-    if (state.server_relay_connected && state.desktop_bridge_connected) {
-      return 'Connected (Server + Desktop)';
-    }
-    if (state.server_relay_connected) {
-      return 'Connected (Server Relay)';
-    }
-    if (state.desktop_bridge_connected) {
-      return 'Connected (Desktop Bridge)';
-    }
-    return 'Standby / Offline';
-  }, [
-    state.desktop_bridge_connected,
-    state.emergency_stopped,
-    state.run_policy,
-    state.server_relay_connected,
-  ]);
-
-  const copilotDialog: StoredDialogDto = useMemo(
-    () => ({
-      chat_id: LOCAL_COPILOT_CHAT_ID,
-      chat_type: 'bot',
-      title: 'Hermes Browser Copilot',
-      peer_user_id: OFFICIAL_BOT_USER_ID,
-      peer_username: 'hermes_browser_copilot',
-      is_bot: true,
-      unread_count: 0,
-      pts: 0,
-      last_message_preview: 'Side-Panel AI & 24-Tool Browser Agent',
-      updated_at_ms: 0,
-    }),
-    [],
-  );
-
-  const visibleDialogs = useMemo(() => {
-    const all = [copilotDialog, ...dialogs.filter((d) => d.chat_id !== LOCAL_COPILOT_CHAT_ID)];
-    const q = searchQuery.trim().toLowerCase();
-    if (!q) return all;
-    return all.filter(
-      (d) =>
-        d.title.toLowerCase().includes(q) ||
-        (d.peer_username ?? '').toLowerCase().includes(q),
+  // =========================================================================
+  // Gate 1: Local Passcode Lock Screen (blocks ALL message DOM access when locked)
+  // =========================================================================
+  if (state.passcode_locked) {
+    return (
+      <PasscodeLockScreen
+        locale={locale}
+        username={state.username}
+        onUnlocked={() => {
+          setState((prev) => ({ ...prev, passcode_locked: false }));
+          void refreshAll();
+        }}
+      />
     );
-  }, [copilotDialog, dialogs, searchQuery]);
-
-  const activeChatId =
-    surface === 'sidepanel' ? LOCAL_COPILOT_CHAT_ID : selectedChatId || LOCAL_COPILOT_CHAT_ID;
-  const activeMessages = messagesByChat[activeChatId] ?? [];
+  }
 
   // =========================================================================
   // Surface 1: Compact Popup (`popup.html`)
   // =========================================================================
   if (surface === 'popup') {
     return (
-      <div className="popup-shell" data-theme={state.theme_mode}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <strong>GPUI Telegram</strong>
-          <span
-            data-testid={CANONICAL_TEST_IDS.browserBridgeStatusPill}
-            className={`status-pill ${
-              state.emergency_stopped || state.run_policy === 'disabled' ? 'stopped' : 'ok'
-            }`}
-          >
-            {bridgeStatusLabel}
-          </span>
-        </div>
-
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span>Browser Control Policy</span>
-          <select
-            className="select"
-            data-testid={CANONICAL_TEST_IDS.browserPolicySelect}
-            value={state.run_policy}
-            onChange={(e) => void handlePolicyChange(e.target.value as BrowserRunPolicy)}
-          >
-            <option value="always_allow_authorized">always_allow_authorized</option>
-            <option value="allow_read_only">allow_read_only</option>
-            <option value="ask_every_time">ask_every_time</option>
-            <option value="disabled">disabled</option>
-          </select>
-        </label>
-
-        <button
-          type="button"
-          className="btn danger"
-          data-testid={CANONICAL_TEST_IDS.emergencyStopBtn}
-          onClick={() => void handleEmergencyStop()}
-        >
-          Emergency Stop (Alt+Shift+S)
-        </button>
-
-        <PendingApprovalList items={pendingApprovals} onDecision={handleApprovalDecision} />
-
-        <div style={{ fontSize: 12, color: 'var(--text-secondary)' }}>
-          Unread Messages: <strong>{state.unread_total}</strong> • Open Tabs:{' '}
-          <strong>{state.active_tabs_count}</strong>
-        </div>
-
-        <div style={{ display: 'flex', gap: 6, marginTop: 'auto' }}>
-          <button
-            type="button"
-            className="btn primary"
-            style={{ flex: 1 }}
-            onClick={() =>
-              chrome.tabs.create({ url: chrome.runtime.getURL('workspace.html'), active: true })
-            }
-          >
-            Open Workspace
-          </button>
-          <button
-            type="button"
-            className="btn"
-            onClick={() => chrome.runtime.openOptionsPage()}
-          >
-            Options
-          </button>
-        </div>
-      </div>
+      <PopupView
+        state={state}
+        locale={locale}
+        themePreset={themePreset}
+        dialogs={dialogs}
+        copilotMessages={messagesByChat[LOCAL_COPILOT_CHAT_ID] ?? []}
+        pendingApprovals={pendingApprovals}
+        onPolicyChange={(p) => void handlePolicyChange(p)}
+        onEmergencyStop={() => void handleEmergencyStop()}
+        onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+        onCycleTheme={handleCycleTheme}
+        onToggleLocale={handleToggleLocale}
+      />
     );
   }
 
   // =========================================================================
-  // Auth Wizard Gate (when logged out on workspace.html)
+  // Gate 2: Auth Wizard (`workspace.html` when logged out or adding account)
   // =========================================================================
-  if (surface === 'workspace' && !state.authenticated) {
+  if (surface === 'workspace' && (!state.authenticated || addingAccountMode)) {
     return (
-      <div className="ext-shell" data-theme={state.theme_mode}>
-        <form
-          className="auth-card"
-          data-testid={CANONICAL_TEST_IDS.authWizard}
-          onSubmit={(e) => void handleAuthSubmit(e)}
-        >
-          <h2 style={{ margin: 0 }}>Sign in to GPUI Telegram</h2>
-          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span>Server URL</span>
-            <input
-              className="input"
-              data-testid={CANONICAL_TEST_IDS.authServerUrlInput}
-              value={authServerUrl}
-              onChange={(e) => setAuthServerUrl(e.target.value)}
-              placeholder="http://127.0.0.1:8080"
-            />
-          </label>
-          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span>Username</span>
-            <input
-              className="input"
-              data-testid={CANONICAL_TEST_IDS.authUsernameInput}
-              value={authUsername}
-              onChange={(e) => setAuthUsername(e.target.value)}
-              placeholder="alice"
-            />
-          </label>
-          <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-            <span>Password</span>
-            <input
-              className="input"
-              type="password"
-              data-testid={CANONICAL_TEST_IDS.authPasswordInput}
-              value={authPassword}
-              onChange={(e) => setAuthPassword(e.target.value)}
-              placeholder="••••••••"
-            />
-          </label>
-          {authError && <div style={{ color: 'var(--danger)', fontSize: 12 }}>{authError}</div>}
-          <button
-            type="submit"
-            className="btn primary"
-            data-testid={CANONICAL_TEST_IDS.authSubmitBtn}
-          >
-            Sign In
-          </button>
-        </form>
+      <AuthWizard
+        initialServerUrl={state.server_url}
+        locale={locale}
+        themePreset={themePreset}
+        onAuthenticated={async () => {
+          setAddingAccountMode(false);
+          setMessagesByChat({});
+          setSelectedChatId(0);
+          await refreshAll();
+        }}
+        onCycleTheme={handleCycleTheme}
+        onToggleLocale={handleToggleLocale}
+        onCancelAddAccount={
+          addingAccountMode && state.authenticated ? () => setAddingAccountMode(false) : undefined
+        }
+      />
+    );
+  }
+
+  const effectiveChatId = selectedChatId || LOCAL_COPILOT_CHAT_ID;
+  const activeDialog: StoredDialogDto =
+    dialogs.find((d) => d.chat_id === effectiveChatId) ?? {
+      chat_id: LOCAL_COPILOT_CHAT_ID,
+      chat_type: 'bot',
+      title: tr(locale, 'sidebar.localCopilot'),
+      peer_user_id: OFFICIAL_BOT_USER_ID,
+      peer_username: 'hermes_browser_copilot',
+      is_bot: true,
+      unread_count: 0,
+      pts: 0,
+      updated_at_ms: 0,
+    };
+
+  const activeMessages = messagesByChat[effectiveChatId] ?? [];
+
+  // =========================================================================
+  // Surface 2: Extension Options Page (`options.html`)
+  // =========================================================================
+  if (surface === 'options') {
+    return (
+      <div className="workspace-shell" data-theme={themePreset}>
+        <SettingsRouter
+          state={state}
+          locale={locale}
+          themePreset={themePreset}
+          fontSize={fontSize}
+          bubbleRadius={bubbleRadius}
+          accentColor={accentColor}
+          pendingApprovals={pendingApprovals}
+          activeSection={settingsSection}
+          onSelectSection={setSettingsSection}
+          onBackToChats={() =>
+            chrome.tabs.create({ url: chrome.runtime.getURL('workspace.html'), active: true })
+          }
+          onPolicyChange={(p) => void handlePolicyChange(p)}
+          onEmergencyStop={() => void handleEmergencyStop()}
+          onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+          onSelectTheme={(p) => void handleSelectTheme(p)}
+          onChangeFontSize={(px) => {
+            setState((prev) => ({ ...prev, font_size: px }));
+            void sendSwRpc({ type: 'ui.set_preferences', font_size: px });
+          }}
+          onChangeBubbleRadius={(px) => {
+            setState((prev) => ({ ...prev, bubble_radius: px }));
+            void sendSwRpc({ type: 'ui.set_preferences', bubble_radius: px });
+          }}
+          onChangeAccentColor={(hex) => {
+            setState((prev) => ({ ...prev, accent_color: hex }));
+            void sendSwRpc({ type: 'ui.set_preferences', accent_color: hex });
+          }}
+          onSelectLocale={(loc) => void handleSelectLocale(loc)}
+          onOpenExportModal={() => setExportModalOpen(true)}
+          onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
+          onLogout={() => void handleLogoutAccount()}
+        />
+        <ExportDataModal
+          open={exportModalOpen}
+          dialogs={dialogs}
+          onClose={() => setExportModalOpen(false)}
+        />
+        <ShortcutsLegendModal
+          open={shortcutsModalOpen}
+          onClose={() => setShortcutsModalOpen(false)}
+        />
       </div>
     );
   }
 
   // =========================================================================
-  // Workspace / Sidepanel / Options Unified Layout
+  // Surface 3: Adaptive Companion Sidepanel (`sidepanel.html`)
   // =========================================================================
-  return (
-    <div className="ext-shell" data-theme={state.theme_mode}>
-      <header className="ext-topbar">
-        <div className="ext-topbar-group">
-          <strong>
-            {surface === 'sidepanel'
-              ? 'Hermes Side-Panel Copilot'
-              : surface === 'options'
-                ? 'GPUI Telegram Settings'
-                : 'GPUI Telegram Workspace'}
-          </strong>
-          <span
-            data-testid={CANONICAL_TEST_IDS.browserBridgeStatusPill}
-            className={`status-pill ${
-              state.emergency_stopped || state.run_policy === 'disabled' ? 'stopped' : 'ok'
-            }`}
-          >
-            {bridgeStatusLabel}
-          </span>
-        </div>
-
-        <div className="ext-topbar-group">
-          <select
-            className="select"
-            aria-label="Browser Run Policy"
-            data-testid={CANONICAL_TEST_IDS.browserPolicySelect}
-            value={state.run_policy}
-            onChange={(e) => void handlePolicyChange(e.target.value as BrowserRunPolicy)}
-          >
-            <option value="always_allow_authorized">always_allow_authorized</option>
-            <option value="allow_read_only">allow_read_only</option>
-            <option value="ask_every_time">ask_every_time</option>
-            <option value="disabled">disabled</option>
-          </select>
-
-          <button
-            type="button"
-            className="btn danger"
-            data-testid={CANONICAL_TEST_IDS.emergencyStopBtn}
-            onClick={() => void handleEmergencyStop()}
-          >
-            Stop Bot
-          </button>
-
-          <button
-            type="button"
-            className="btn"
-            data-testid={CANONICAL_TEST_IDS.themeToggleBtn}
-            onClick={() =>
-              void sendSwRpc({
-                type: 'ui.set_preferences',
-                theme_mode: state.theme_mode === 'dark' ? 'light' : 'dark',
-              })
-            }
-          >
-            {state.theme_mode === 'dark' ? 'Light' : 'Dark'}
-          </button>
-
-          <button
-            type="button"
-            className="btn"
-            data-testid={CANONICAL_TEST_IDS.langToggleBtn}
-            onClick={() =>
-              void sendSwRpc({
-                type: 'ui.set_preferences',
-                language_code: state.language_code === 'en' ? 'ru' : 'en',
-              })
-            }
-          >
-            {state.language_code.toUpperCase()}
-          </button>
-        </div>
-      </header>
-
-      <div className="ext-body">
-        {surface === 'workspace' && (
-          <nav className="nav-rail" data-testid={CANONICAL_TEST_IDS.navRail}>
+  if (surface === 'sidepanel') {
+    return (
+      <div className="sidepanel-shell" data-theme={themePreset}>
+        <header className="sidepanel-header">
+          <div className="row-gap-4">
             <button
               type="button"
-              className={`nav-btn ${activeNavTab === 'chats' ? 'active' : ''}`}
+              className={`btn ghost xs ${activeNavTab === 'chats' ? 'primary-soft' : ''}`}
               onClick={() => setActiveNavTab('chats')}
             >
-              Chats
+              💬 {tr(locale, 'nav.chats')}
             </button>
             <button
               type="button"
-              className={`nav-btn ${activeNavTab === 'studio' ? 'active' : ''}`}
-              aria-label="Hermes Studio & Approvals"
+              className={`btn ghost xs ${activeNavTab === 'studio' ? 'primary-soft' : ''}`}
               onClick={() => setActiveNavTab('studio')}
             >
-              Studio{pendingApprovals.length > 0 ? ` (${pendingApprovals.length})` : ''}
+              🧠 {tr(locale, 'nav.studio')}
             </button>
             <button
               type="button"
-              className={`nav-btn ${activeNavTab === 'settings' ? 'active' : ''}`}
+              className={`btn ghost xs ${activeNavTab === 'settings' ? 'primary-soft' : ''}`}
               onClick={() => setActiveNavTab('settings')}
             >
-              Settings
+              ⚙️ {tr(locale, 'nav.settings')}
             </button>
-          </nav>
-        )}
+          </div>
+          <div className="row-gap-4">
+            <button
+              type="button"
+              className="btn ghost xs"
+              data-testid={CANONICAL_TEST_IDS.themeToggleBtn}
+              title={tr(locale, 'nav.theme')}
+              onClick={handleCycleTheme}
+            >
+              🌓
+            </button>
+            <button
+              type="button"
+              className="btn ghost xs"
+              data-testid={CANONICAL_TEST_IDS.langToggleBtn}
+              title={tr(locale, 'nav.language')}
+              onClick={handleToggleLocale}
+            >
+              {locale === 'zh-CN' ? '中' : 'EN'}
+            </button>
+          </div>
+        </header>
 
-        {surface === 'workspace' && activeNavTab === 'chats' && (
-          <aside className="chat-sidebar" data-testid={CANONICAL_TEST_IDS.chatSidebar}>
-            <div className="sidebar-header">
-              <input
-                className="input"
-                style={{ flex: 1 }}
-                data-testid={CANONICAL_TEST_IDS.chatSearchInput}
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search chats..."
-              />
-              <button
-                type="button"
-                className="btn"
-                data-testid={CANONICAL_TEST_IDS.createMenuBtn}
-                onClick={() => void sendSwRpc({ type: 'ui.sync_dialogs' })}
-                title="Refresh / Create"
-              >
-                +
-              </button>
-            </div>
-
-            <div className="dialog-list">
-              {visibleDialogs.map((dlg) => (
-                <button
-                  key={dlg.chat_id}
-                  type="button"
-                  className={`dialog-row ${activeChatId === dlg.chat_id ? 'selected' : ''}`}
-                  data-chat-id={dlg.chat_id}
-                  data-dialog-id={dlg.chat_id}
-                  onClick={() => handleSelectDialog(dlg)}
-                >
-                  <div style={{ overflow: 'hidden' }}>
-                    <div style={{ fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {dlg.title}
-                    </div>
-                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                      {dlg.last_message_preview || (dlg.peer_username ? `@${dlg.peer_username}` : '')}
-                    </div>
-                  </div>
-                  {dlg.unread_count > 0 && (
-                    <span className="unread-badge">{dlg.unread_count}</span>
-                  )}
-                </button>
-              ))}
-            </div>
-          </aside>
-        )}
-
-        {activeNavTab === 'studio' && surface === 'workspace' ? (
-          <section
-            className="stage-wrap"
-            style={{ padding: 16, overflowY: 'auto' }}
-            data-testid={CANONICAL_TEST_IDS.hermesStudioWorkspace}
-          >
-            <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}>
-              <button
-                type="button"
-                role="tab"
-                data-tab="approvals"
-                className={`btn ${studioSubTab === 'approvals' ? 'primary' : ''}`}
-                onClick={() => setStudioSubTab('approvals')}
-              >
-                Approvals ({pendingApprovals.length})
-              </button>
-              <button
-                type="button"
-                role="tab"
-                data-tab="overview"
-                className={`btn ${studioSubTab === 'overview' ? 'primary' : ''}`}
-                onClick={() => setStudioSubTab('overview')}
-              >
-                Bridge Overview
-              </button>
-            </div>
-
-            {studioSubTab === 'approvals' ? (
-              <div>
-                <h3>Pending Browser Command Approvals</h3>
-                {pendingApprovals.length === 0 ? (
-                  <p style={{ color: 'var(--text-secondary)' }}>No pending browser commands.</p>
-                ) : (
-                  <PendingApprovalList
-                    items={pendingApprovals}
-                    onDecision={handleApprovalDecision}
-                  />
-                )}
-              </div>
-            ) : (
-              <div>
-                <h3>24-Tool Browser Bridge Status</h3>
-                <p>Extension ID: <code>{state.extension_id}</code></p>
-                <p>Server Relay: <strong>{state.server_relay_connected ? 'Connected' : 'Disconnected'}</strong></p>
-                <p>Desktop Loopback Bridge: <strong>{state.desktop_bridge_connected ? 'Connected' : 'Disconnected'}</strong></p>
-                <p>WASM Core Ready: <strong>{state.wasm_ready ? 'Yes' : 'Loading'}</strong></p>
-              </div>
-            )}
-          </section>
-        ) : activeNavTab === 'settings' || surface === 'options' ? (
-          <section
-            className="stage-wrap"
-            style={{ padding: 16, overflowY: 'auto', gap: 12 }}
-            data-testid={CANONICAL_TEST_IDS.settingsRouter}
-          >
-            <h3 style={{ margin: 0 }}>Security & Domain Access Control</h3>
-            <PendingApprovalList items={pendingApprovals} onDecision={handleApprovalDecision} />
-
-            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, maxWidth: 480 }}>
-              <span>Allowed Domains (comma-separated, empty = allow all http/https)</span>
-              <input
-                className="input"
-                value={allowedDomainsText}
-                onChange={(e) => setAllowedDomainsText(e.target.value)}
-                placeholder="example.com, 127.0.0.1"
-              />
-            </label>
-
-            <label style={{ display: 'flex', flexDirection: 'column', gap: 4, maxWidth: 480 }}>
-              <span>Blocked Domains (comma-separated)</span>
-              <input
-                className="input"
-                value={blockedDomainsText}
-                onChange={(e) => setBlockedDomainsText(e.target.value)}
-                placeholder="localhost, untrusted.invalid"
-              />
-            </label>
-
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button
-                type="button"
-                className="btn primary"
-                onClick={() =>
-                  void sendSwRpc({
-                    type: 'ui.set_policy',
-                    policy: state.run_policy,
-                    allowed_domains: allowedDomainsText
-                      .split(',')
-                      .map((s) => s.trim())
-                      .filter(Boolean),
-                    blocked_domains: blockedDomainsText
-                      .split(',')
-                      .map((s) => s.trim())
-                      .filter(Boolean),
-                  })
-                }
-              >
-                Save Domain Policy
-              </button>
-
-              {state.authenticated && (
-                <button
-                  type="button"
-                  className="btn danger"
-                  onClick={() => void sendSwRpc({ type: 'ui.logout' })}
-                >
-                  Log Out
-                </button>
-              )}
-            </div>
-          </section>
+        {activeNavTab === 'chats' ? (
+          <>
+            <ChatSidebar
+              surface="sidepanel"
+              locale={locale}
+              authenticated={state.authenticated}
+              dialogs={dialogs}
+              selectedChatId={effectiveChatId}
+              selectedTopicId={selectedTopicId}
+              sidebarWidth={sidebarWidth}
+              collapsed={false}
+              searchInputRef={searchInputRef}
+              showArchivedDrawer={showArchivedDrawer}
+              onToggleArchivedDrawer={setShowArchivedDrawer}
+              onResizeWidth={setSidebarWidth}
+              onSelectDialog={handleSelectDialog}
+              onSelectTopic={setSelectedTopicId}
+              onDialogsChanged={refreshAll}
+            />
+            <ConversationStage
+              surface="sidepanel"
+              state={state}
+              locale={locale}
+              activeDialog={activeDialog}
+              selectedTopicId={selectedTopicId}
+              messages={activeMessages}
+              pendingApprovals={pendingApprovals}
+              inspectorOpen={false}
+              onPolicyChange={(p) => void handlePolicyChange(p)}
+              onEmergencyStop={() => void handleEmergencyStop()}
+              onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+              onToggleInspector={() => {}}
+              onOpenBotStudio={() => {}}
+              onOpenMiniAppPicker={() => setMiniAppPickerOpen(true)}
+              onOpenMiniAppUrl={(url, title) =>
+                setActiveMiniApp({
+                  botUsername: activeDialog.peer_username || 'bot',
+                  shortName: 'app',
+                  title: title || 'Mini App',
+                  launchUrl: url,
+                  companionChatId: effectiveChatId,
+                })
+              }
+              onStartCall={(video) => setCallOverlay({ open: true, video })}
+              onStartTalkMode={() => setTalkModeOpen(true)}
+              onOpenPollModal={() => setPollModalOpen(true)}
+              onOpenForwardModal={(m) => setForwardMsg(m)}
+              onOpenE2eeVerify={() => setE2eeModalOpen(true)}
+              onMessagesMutated={() => void loadChatMessages(effectiveChatId)}
+            />
+          </>
+        ) : activeNavTab === 'studio' ? (
+          <HermesStudio
+            state={state}
+            locale={locale}
+            pendingApprovals={pendingApprovals}
+            initialTab="approvals"
+            onPolicyChange={(p) => void handlePolicyChange(p)}
+            onEmergencyStop={() => void handleEmergencyStop()}
+            onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+          />
         ) : (
-          <main className="stage-wrap" data-testid={CANONICAL_TEST_IDS.conversationStage}>
-            <div className="messages-scroll">
-              <PendingApprovalList items={pendingApprovals} onDecision={handleApprovalDecision} />
-
-              {activeMessages.map((msg) => {
-                const isMine =
-                  state.user_id !== null && msg.sender_id === state.user_id;
-                return (
-                  <article
-                    key={`${msg.chat_id}:${msg.message_id}`}
-                    className={`msg-bubble ${isMine ? 'mine' : ''} ${msg.is_error ? 'error' : ''}`}
-                    data-testid={CANONICAL_TEST_IDS.messageBubble}
-                    data-message-id={msg.message_id}
-                  >
-                    {msg.thinking && (
-                      <div
-                        className="thinking-box"
-                        data-testid={CANONICAL_TEST_IDS.thinkingBubble}
-                      >
-                        💭 {msg.thinking}
-                      </div>
-                    )}
-
-                    {msg.tool_steps && msg.tool_steps.length > 0 && (
-                      <div
-                        className="steps-box"
-                        data-testid={CANONICAL_TEST_IDS.toolStepsList}
-                      >
-                        <div style={{ fontWeight: 700, marginBottom: 3 }}>
-                          🔧 Steps ({msg.tool_steps.length})
-                        </div>
-                        {msg.tool_steps.map((st) => (
-                          <div key={st.id}>
-                            • <code>{st.tool}</code> [{st.status}]
-                            {st.result_summary ? ` — ${st.result_summary}` : ''}
-                          </div>
-                        ))}
-                      </div>
-                    )}
-
-                    <div>{msg.text}</div>
-
-                    {msg.media_data_url && (
-                      <img
-                        src={msg.media_data_url}
-                        alt="Captured browser screenshot"
-                        style={{
-                          maxWidth: '100%',
-                          maxHeight: 220,
-                          borderRadius: 6,
-                          marginTop: 6,
-                          border: '1px solid var(--border)',
-                        }}
-                      />
-                    )}
-
-                    {msg.edited_at_ms && (
-                      <span style={{ fontSize: 10, opacity: 0.75, marginLeft: 6 }}>(edited)</span>
-                    )}
-
-                    {msg.reactions && msg.reactions.length > 0 && (
-                      <div className="reactions-row">
-                        {msg.reactions.map((r) => (
-                          <span key={r.emoji} className="reaction-chip">
-                            {r.emoji} {r.count}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                  </article>
-                );
-              })}
-            </div>
-
-            <div className="composer-bar">
-              {composerText.startsWith('/') && (
-                <div
-                  className="slash-popup"
-                  data-testid={CANONICAL_TEST_IDS.slashCommandPopup}
-                >
-                  {SLASH_SUGGESTIONS.filter((cmd) =>
-                    cmd.startsWith(composerText.toLowerCase()),
-                  ).map((cmd) => (
-                    <button
-                      key={cmd}
-                      type="button"
-                      className="btn"
-                      style={{ textAlign: 'left' }}
-                      onClick={() => setComposerText(`${cmd} `)}
-                    >
-                      {cmd}
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              <textarea
-                className="composer-input"
-                data-testid={CANONICAL_TEST_IDS.canonicalComposerInput}
-                value={composerText}
-                onChange={(e) => setComposerText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    void handleSendComposer();
-                  }
-                }}
-                placeholder={
-                  surface === 'sidepanel'
-                    ? 'Ask Hermes Copilot or run /browser status...'
-                    : 'Write a message...'
-                }
-              />
-
-              {state.bot_streaming && (
-                <button
-                  type="button"
-                  className="btn danger"
-                  data-testid={CANONICAL_TEST_IDS.composerStopBtn}
-                  aria-label="Stop generation"
-                  onClick={() => void handleStopBot()}
-                >
-                  Stop
-                </button>
-              )}
-
-              <button
-                type="button"
-                className="btn primary"
-                data-testid={CANONICAL_TEST_IDS.composerSendBtn}
-                onClick={() => void handleSendComposer()}
-              >
-                Send
-              </button>
-            </div>
-          </main>
+          <SettingsRouter
+            state={state}
+            locale={locale}
+            themePreset={themePreset}
+            fontSize={fontSize}
+            bubbleRadius={bubbleRadius}
+            accentColor={accentColor}
+            pendingApprovals={pendingApprovals}
+            activeSection={settingsSection}
+            onSelectSection={setSettingsSection}
+            onBackToChats={() => setActiveNavTab('chats')}
+            onPolicyChange={(p) => void handlePolicyChange(p)}
+            onEmergencyStop={() => void handleEmergencyStop()}
+            onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+            onSelectTheme={(p) => void handleSelectTheme(p)}
+            onChangeFontSize={(px) => {
+              setState((prev) => ({ ...prev, font_size: px }));
+              void sendSwRpc({ type: 'ui.set_preferences', font_size: px });
+            }}
+            onChangeBubbleRadius={(px) => {
+              setState((prev) => ({ ...prev, bubble_radius: px }));
+              void sendSwRpc({ type: 'ui.set_preferences', bubble_radius: px });
+            }}
+            onChangeAccentColor={(hex) => {
+              setState((prev) => ({ ...prev, accent_color: hex }));
+              void sendSwRpc({ type: 'ui.set_preferences', accent_color: hex });
+            }}
+            onSelectLocale={(loc) => void handleSelectLocale(loc)}
+            onOpenExportModal={() => setExportModalOpen(true)}
+            onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
+            onLogout={() => void handleLogoutAccount()}
+          />
         )}
 
-        {surface === 'workspace' && activeNavTab === 'chats' && (
-          <aside
-            className="context-inspector"
-            data-testid={CANONICAL_TEST_IDS.contextInspector}
-          >
-            <div style={{ fontWeight: 700, marginBottom: 8 }}>Inspector</div>
-            <div style={{ fontSize: 12, color: 'var(--text-secondary)', display: 'flex', flexDirection: 'column', gap: 5 }}>
-              <div>WS Sync: {state.server_ws_connected ? 'Online' : 'Standby'}</div>
-              <div>Server Relay: {state.server_relay_connected ? 'Connected' : 'Standby'}</div>
-              <div>Desktop Bridge: {state.desktop_bridge_connected ? 'Connected' : 'Standby'}</div>
-              <div>WASM Core: {state.wasm_ready ? 'Loaded' : 'Init'}</div>
-              <div>Policy: {state.run_policy}</div>
-            </div>
-          </aside>
-        )}
+        <MiniAppPickerModal
+          open={miniAppPickerOpen}
+          activeChatId={effectiveChatId}
+          activeBotUsername={activeDialog.peer_username}
+          onClose={() => setMiniAppPickerOpen(false)}
+          onLaunchMiniApp={(sess) => {
+            setMiniAppPickerOpen(false);
+            setActiveMiniApp(sess);
+          }}
+        />
+        <MiniAppHostModal
+          session={activeMiniApp}
+          onClose={() => setActiveMiniApp(null)}
+          onDataDispatched={(cid) => void loadChatMessages(cid)}
+        />
       </div>
+    );
+  }
+
+  // =========================================================================
+  // Surface 4: Full 4-Column Desktop `AppShell` (`workspace.html`)
+  // =========================================================================
+  return (
+    <div className="workspace-shell" data-theme={themePreset}>
+      {/* Column 1: 52px NavRail at x=0 */}
+      <NavRail
+        state={state}
+        locale={locale}
+        themePreset={themePreset}
+        activeTab={activeNavTab}
+        pendingApprovalsCount={pendingApprovals.length}
+        accountMenuOpen={accountMenuOpen}
+        onToggleAccountMenu={() => setAccountMenuOpen((v) => !v)}
+        onSelectTab={setActiveNavTab}
+        onOpenMainMenu={() => setMainMenuOpen(true)}
+        onOpenBrowserWorkbench={() => setBrowserWorkbenchOpen(true)}
+        onOpenMiniAppLauncher={() => setMiniAppPickerOpen(true)}
+        onCycleTheme={handleCycleTheme}
+        onSelectTheme={(p) => void handleSelectTheme(p)}
+        onToggleLocale={handleToggleLocale}
+        onLockApp={() => {
+          if (state.passcode_enabled) {
+            void sendSwRpc({ type: 'ui.set_preferences', passcode_locked: true });
+          } else {
+            setActiveNavTab('settings');
+            setSettingsSection('LocalPasscode');
+          }
+        }}
+        onSwitchAccount={(id) => void handleSwitchAccount(id)}
+        onAddAccount={() => {
+          setAccountMenuOpen(false);
+          setAddingAccountMode(true);
+        }}
+        onLogoutAccount={(id) => void handleLogoutAccount(id)}
+      />
+
+      {/* Column 2: 288px Resizable [240..360] ChatSidebar */}
+      {activeNavTab === 'chats' && (
+        <ChatSidebar
+          surface="workspace"
+          locale={locale}
+          authenticated={state.authenticated}
+          dialogs={dialogs}
+          selectedChatId={effectiveChatId}
+          selectedTopicId={selectedTopicId}
+          sidebarWidth={sidebarWidth}
+          collapsed={sidebarCollapsed}
+          searchInputRef={searchInputRef}
+          showArchivedDrawer={showArchivedDrawer}
+          onToggleArchivedDrawer={setShowArchivedDrawer}
+          onResizeWidth={(w) => {
+            setSidebarWidth(w);
+            if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+              void chrome.storage.local.set({ sidebar_width: w });
+            }
+          }}
+          onSelectDialog={handleSelectDialog}
+          onSelectTopic={setSelectedTopicId}
+          onDialogsChanged={refreshAll}
+        />
+      )}
+
+      {/* Column 3: Flexible Center Stage (ConversationStage | HermesStudio | SettingsRouter) */}
+      {activeNavTab === 'studio' ? (
+        <HermesStudio
+          state={state}
+          locale={locale}
+          pendingApprovals={pendingApprovals}
+          initialTab={pendingApprovals.length > 0 ? 'approvals' : 'tasks'}
+          onPolicyChange={(p) => void handlePolicyChange(p)}
+          onEmergencyStop={() => void handleEmergencyStop()}
+          onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+        />
+      ) : activeNavTab === 'settings' ? (
+        <SettingsRouter
+          state={state}
+          locale={locale}
+          themePreset={themePreset}
+          fontSize={fontSize}
+          bubbleRadius={bubbleRadius}
+          accentColor={accentColor}
+          pendingApprovals={pendingApprovals}
+          activeSection={settingsSection}
+          onSelectSection={setSettingsSection}
+          onBackToChats={() => setActiveNavTab('chats')}
+          onPolicyChange={(p) => void handlePolicyChange(p)}
+          onEmergencyStop={() => void handleEmergencyStop()}
+          onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+          onSelectTheme={(p) => void handleSelectTheme(p)}
+          onChangeFontSize={(px) => {
+            setState((prev) => ({ ...prev, font_size: px }));
+            void sendSwRpc({ type: 'ui.set_preferences', font_size: px });
+          }}
+          onChangeBubbleRadius={(px) => {
+            setState((prev) => ({ ...prev, bubble_radius: px }));
+            void sendSwRpc({ type: 'ui.set_preferences', bubble_radius: px });
+          }}
+          onChangeAccentColor={(hex) => {
+            setState((prev) => ({ ...prev, accent_color: hex }));
+            void sendSwRpc({ type: 'ui.set_preferences', accent_color: hex });
+          }}
+          onSelectLocale={(loc) => void handleSelectLocale(loc)}
+          onOpenExportModal={() => setExportModalOpen(true)}
+          onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
+          onLogout={() => void handleLogoutAccount()}
+        />
+      ) : (
+        <ConversationStage
+          surface="workspace"
+          state={state}
+          locale={locale}
+          activeDialog={activeDialog}
+          selectedTopicId={selectedTopicId}
+          messages={activeMessages}
+          pendingApprovals={pendingApprovals}
+          inspectorOpen={inspectorOpen}
+          onPolicyChange={(p) => void handlePolicyChange(p)}
+          onEmergencyStop={() => void handleEmergencyStop()}
+          onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+          onToggleInspector={() => setInspectorOpen((v) => !v)}
+          onOpenBotStudio={() => {
+            setInspectorTab('studio');
+            setInspectorOpen(true);
+          }}
+          onOpenMiniAppPicker={() => setMiniAppPickerOpen(true)}
+          onOpenMiniAppUrl={(url, title) =>
+            setActiveMiniApp({
+              botUsername: activeDialog.peer_username || 'bot',
+              shortName: 'app',
+              title: title || 'Mini App',
+              launchUrl: url,
+              companionChatId: effectiveChatId,
+            })
+          }
+          onStartCall={(video) => setCallOverlay({ open: true, video })}
+          onStartTalkMode={() => setTalkModeOpen(true)}
+          onOpenPollModal={() => setPollModalOpen(true)}
+          onOpenForwardModal={(m) => setForwardMsg(m)}
+          onOpenE2eeVerify={() => setE2eeModalOpen(true)}
+          onMessagesMutated={() => void loadChatMessages(effectiveChatId)}
+        />
+      )}
+
+      {/* Column 4: 320px Toggleable ContextInspector */}
+      {activeNavTab === 'chats' && inspectorOpen && (
+        <ContextInspector
+          state={state}
+          locale={locale}
+          activeDialog={activeDialog}
+          messages={activeMessages}
+          initialTab={inspectorTab}
+          onClose={() => setInspectorOpen(false)}
+          onStartCall={(video) => setCallOverlay({ open: true, video })}
+          onOpenMiniAppPicker={() => setMiniAppPickerOpen(true)}
+        />
+      )}
+
+      {/* Main Menu Drawer & Global Modals */}
+      <MainMenuDrawer
+        open={mainMenuOpen}
+        state={state}
+        locale={locale}
+        themePreset={themePreset}
+        onClose={() => setMainMenuOpen(false)}
+        onOpenSavedMessages={() => {
+          setSelectedChatId(LOCAL_COPILOT_CHAT_ID);
+          setActiveNavTab('chats');
+        }}
+        onOpenArchivedChats={() => {
+          setShowArchivedDrawer(true);
+          setActiveNavTab('chats');
+        }}
+        onOpenStudio={() => setActiveNavTab('studio')}
+        onOpenSettings={(sec) => {
+          if (sec) setSettingsSection(sec as SettingsSectionId);
+          setActiveNavTab('settings');
+        }}
+        onOpenShortcuts={() => setShortcutsModalOpen(true)}
+        onCycleTheme={handleCycleTheme}
+        onSelectTheme={(p) => void handleSelectTheme(p)}
+        onToggleLocale={handleToggleLocale}
+        onAddAccount={() => setAddingAccountMode(true)}
+        onLogout={() => void handleLogoutAccount()}
+      />
+
+      <MiniAppPickerModal
+        open={miniAppPickerOpen}
+        activeChatId={effectiveChatId}
+        activeBotUsername={activeDialog.peer_username}
+        onClose={() => setMiniAppPickerOpen(false)}
+        onLaunchMiniApp={(sess) => {
+          setMiniAppPickerOpen(false);
+          setActiveMiniApp(sess);
+        }}
+      />
+
+      <MiniAppHostModal
+        session={activeMiniApp}
+        onClose={() => setActiveMiniApp(null)}
+        onDataDispatched={(cid) => void loadChatMessages(cid)}
+      />
+
+      <CallOverlay
+        open={callOverlay.open}
+        chatId={effectiveChatId}
+        peerTitle={activeDialog.title}
+        initialVideo={callOverlay.video}
+        onClose={() => setCallOverlay({ open: false, video: false })}
+      />
+
+      <TalkModeOverlay
+        open={talkModeOpen}
+        chatId={effectiveChatId}
+        onClose={() => setTalkModeOpen(false)}
+      />
+
+      <CreatePollModal
+        open={pollModalOpen}
+        chatId={effectiveChatId}
+        onClose={() => setPollModalOpen(false)}
+        onCreated={() => void loadChatMessages(effectiveChatId)}
+      />
+
+      <ForwardMessageModal
+        message={forwardMsg}
+        dialogs={dialogs}
+        onClose={() => setForwardMsg(null)}
+        onForwarded={(cid) => {
+          setSelectedChatId(cid);
+          void loadChatMessages(cid);
+        }}
+      />
+
+      <E2eeVerifyModal
+        open={e2eeModalOpen}
+        peerUserId={activeDialog.peer_user_id}
+        peerTitle={activeDialog.title}
+        onClose={() => setE2eeModalOpen(false)}
+      />
+
+      <ShortcutsLegendModal
+        open={shortcutsModalOpen}
+        onClose={() => setShortcutsModalOpen(false)}
+      />
+
+      <ExportDataModal
+        open={exportModalOpen}
+        dialogs={dialogs}
+        onClose={() => setExportModalOpen(false)}
+      />
+
+      <BrowserWorkbenchModal
+        open={browserWorkbenchOpen}
+        onClose={() => setBrowserWorkbenchOpen(false)}
+      />
     </div>
   );
 }

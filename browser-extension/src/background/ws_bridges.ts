@@ -325,6 +325,22 @@ class SingleOutboundBridgeClient {
           timeoutMs: typeof params.timeout_ms === 'number' ? params.timeout_ms : undefined,
         });
 
+        if (
+          toolName === 'browser_screenshot' &&
+          result &&
+          typeof (result as Record<string, unknown>).data_url === 'string'
+        ) {
+          void chrome.storage.local
+            .set({
+              last_relay_screenshot: {
+                chat_id: typeof caller.chat_id === 'number' ? caller.chat_id : null,
+                data_url: (result as Record<string, unknown>).data_url,
+                timestamp_ms: Date.now(),
+              },
+            })
+            .catch(() => undefined);
+        }
+
         this.sendJson({
           jsonrpc: '2.0',
           id: reqId,

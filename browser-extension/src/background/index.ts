@@ -13,6 +13,10 @@ import {
   KEEPALIVE_ALARM_NAME,
   LOCAL_COPILOT_CHAT_ID,
   UI_PORT_NAME,
+  clampBubbleRadiusPx,
+  clampFontSizePx,
+  normalizeExtensionLocale,
+  normalizeThemePreset,
   type BrowserRunPolicy,
   type ExtensionRuntimeStateSummary,
   type SwToUiEvent,
@@ -20,11 +24,17 @@ import {
 import { ensureWasmLoaded, invokeWasm, isWasmReady } from '../wasm/wasm_bridge';
 import { BrowserController } from './browser_controller';
 import {
-  clearAuthSessionInStorage,
+  dbClearChatMessages,
+  dbDeleteDialog,
+  dbDeleteMessages,
   dbGetAllDialogs,
   dbGetMessagesForChat,
+  dbSetChatUnreadCount,
+  logoutActiveAccountInStorage,
   openExtDb,
   readNormalizedStorageConfig,
+  switchActiveAccountInStorage,
+  upsertAccountSessionInStorage,
 } from './db';
 import { ExtensionBotRunner } from './ext_bot_runner';
 import { BrowserPolicyEngine } from './policy_engine';
@@ -70,7 +80,9 @@ async function buildRuntimeStateSummary(): Promise<ExtensionRuntimeStateSummary>
   const dialogs = await dbGetAllDialogs().catch(() => []);
   const tabs = await browserController.listTabsSummary().catch(() => []);
   const bridgeSt = dualBridges.getStatus();
-  const unreadTotal = dialogs.reduce((acc, d) => acc + (d.unread_count || 0), 0);
+  const unreadTotal = dialogs
+    .filter((d) => !d.is_archived)
+    .reduce((acc, d) => acc + (d.unread_count || 0), 0);
 
   return {
     authenticated: Boolean(cfg.serverUrl && cfg.token),
@@ -91,7 +103,15 @@ async function buildRuntimeStateSummary(): Promise<ExtensionRuntimeStateSummary>
     bot_streaming: botRunner.isStreaming(),
     active_bot_run_id: botRunner.getActiveRunId(),
     theme_mode: cfg.themeMode,
+    theme_preset: cfg.themePreset,
+    font_size: cfg.fontSize,
+    bubble_radius: cfg.bubbleRadius,
+    accent_color: cfg.accentColor,
     language_code: cfg.languageCode,
+    passcode_enabled: cfg.passcodeEnabled,
+    passcode_locked: cfg.passcodeLocked,
+    accounts: cfg.accounts,
+    active_account_id: cfg.activeAccountId,
     wasm_ready: isWasmReady(),
   };
 }
@@ -255,7 +275,11 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
         changes.desktop_bridge ||
         changes.browser_bridge ||
         changes.pairing_token ||
-        changes.desktop_bridge_port,
+        changes.desktop_bridge_port ||
+        changes.active_account_id ||
+        changes.token ||
+        changes.auth_token ||
+        changes.server_url,
     );
     void rehydrateAll(bridgeChanged);
   }, 40);
@@ -323,9 +347,13 @@ async function handleUiRpcMessage(msg: Record<string, any>): Promise<Record<stri
 
     case 'ui.get_messages': {
       const chatId = Number(msg.chat_id ?? LOCAL_COPILOT_CHAT_ID);
-      const localMsgs = await dbGetMessagesForChat(chatId, 200);
+      let localMsgs = await dbGetMessagesForChat(chatId, 200);
       if (chatId > 0) {
-        void syncEngine.fetchChatHistory(chatId, 80);
+        if (localMsgs.length === 0) {
+          localMsgs = await syncEngine.fetchChatHistory(chatId, 80);
+        } else {
+          void syncEngine.fetchChatHistory(chatId, 80);
+        }
       }
       return { ok: true, chat_id: chatId, messages: localMsgs };
     }
@@ -335,7 +363,11 @@ async function handleUiRpcMessage(msg: Record<string, any>): Promise<Record<stri
       const text = String(msg.text ?? '');
       const surface = String(msg.surface ?? '');
 
-      if (surface === 'sidepanel' || chatId === LOCAL_COPILOT_CHAT_ID || msg.use_local_bot === true) {
+      if (
+        chatId === LOCAL_COPILOT_CHAT_ID ||
+        msg.use_local_bot === true ||
+        (surface === 'sidepanel' && chatId <= 0)
+      ) {
         return botRunner.handleUserPrompt({ chatId, text });
       }
 
@@ -343,6 +375,10 @@ async function handleUiRpcMessage(msg: Record<string, any>): Promise<Record<stri
         chatId,
         text,
         replyToMessageId: typeof msg.reply_to_message_id === 'number' ? msg.reply_to_message_id : null,
+        quoteText: typeof msg.quote_text === 'string' ? msg.quote_text : null,
+        topicId: typeof msg.topic_id === 'number' ? msg.topic_id : null,
+        content: msg.content && typeof msg.content === 'object' ? msg.content : null,
+        mediaId: typeof msg.media_id === 'string' ? msg.media_id : null,
         clientNonce: typeof msg.client_nonce === 'string' ? msg.client_nonce : undefined,
       });
     }
@@ -391,56 +427,140 @@ async function handleUiRpcMessage(msg: Record<string, any>): Promise<Record<stri
       return { ok: true };
     }
 
+    case 'ui.mark_unread': {
+      const chatId = Number(msg.chat_id);
+      if (Number.isFinite(chatId)) {
+        await dbSetChatUnreadCount(chatId, 1);
+        await emitStateSnapshot();
+      }
+      return { ok: true };
+    }
+
+    case 'ui.delete_dialog': {
+      const chatId = Number(msg.chat_id);
+      if (Number.isFinite(chatId)) {
+        await dbDeleteDialog(chatId);
+        await emitStateSnapshot();
+      }
+      return { ok: true };
+    }
+
+    case 'ui.clear_chat': {
+      const chatId = Number(msg.chat_id);
+      if (Number.isFinite(chatId)) {
+        await dbClearChatMessages(chatId);
+        broadcastToUi({ type: 'messages_updated', chat_id: chatId, messages: [] });
+      }
+      return { ok: true };
+    }
+
+    case 'ui.delete_messages': {
+      const chatId = Number(msg.chat_id);
+      const ids = Array.isArray(msg.message_ids) ? msg.message_ids.map(Number).filter(Number.isFinite) : [];
+      if (Number.isFinite(chatId) && ids.length > 0) {
+        await dbDeleteMessages(chatId, ids);
+        const remaining = await dbGetMessagesForChat(chatId, 200);
+        broadcastToUi({ type: 'messages_updated', chat_id: chatId, messages: remaining });
+      }
+      return { ok: true };
+    }
+
     case 'ui.login_success': {
       const serverUrl = String(msg.server_url ?? '').trim().replace(/\/+$/, '');
       const token = String(msg.token ?? '').trim();
       const userId = typeof msg.user_id === 'number' ? msg.user_id : null;
       const username = typeof msg.username === 'string' ? msg.username : null;
+      const sessionId = typeof msg.session_id === 'string' ? msg.session_id : undefined;
+      const firstName = typeof msg.first_name === 'string' ? msg.first_name : undefined;
 
-      await chrome.storage.local.set({
-        server_url: serverUrl,
+      await upsertAccountSessionInStorage({
         serverUrl,
         token,
-        auth_token: token,
-        user_id: userId,
+        userId,
         username,
-        session: {
-          server_url: serverUrl,
-          token,
-          user_id: userId,
-          username,
-        },
-        auth_session: {
-          server_url: serverUrl,
-          token,
-          user_id: userId,
-          username,
-        },
+        sessionId,
+        firstName,
       });
       await rehydrateAll(true);
       return { ok: true };
     }
 
+    case 'ui.switch_account': {
+      syncEngine.disconnectWs();
+      const switched = await switchActiveAccountInStorage(msg.account_id ?? '');
+      if (!switched.ok) {
+        return { ok: false, error: switched.error };
+      }
+      await rehydrateAll(true);
+      const dialogs = await dbGetAllDialogs().catch(() => []);
+      return { ok: true, account: switched.switchedTo, dialogs };
+    }
+
     case 'ui.logout': {
       syncEngine.disconnectWs();
-      await clearAuthSessionInStorage();
+      const res = await logoutActiveAccountInStorage(
+        msg.account_id !== undefined ? msg.account_id : null,
+      );
       await rehydrateAll(true);
-      return { ok: true };
+      return { ok: true, remaining_account: res.remainingAccount };
     }
 
     case 'ui.set_preferences': {
       const patch: Record<string, unknown> = {};
-      if (msg.theme_mode === 'light' || msg.theme_mode === 'dark') {
+      if (msg.theme_preset !== undefined || msg.theme !== undefined) {
+        const preset = normalizeThemePreset(
+          msg.theme_preset ?? msg.theme,
+          msg.theme_mode,
+        );
+        patch.theme_preset = preset;
+        patch.theme = preset;
+        patch.theme_mode = preset === 'day' || preset === 'classic' ? 'light' : 'dark';
+      } else if (msg.theme_mode === 'light' || msg.theme_mode === 'dark') {
         patch.theme_mode = msg.theme_mode;
+        patch.theme_preset = msg.theme_mode === 'light' ? 'day' : 'night';
+        patch.theme = patch.theme_preset;
       }
-      if (msg.language_code === 'en' || msg.language_code === 'ru') {
-        patch.language_code = msg.language_code;
+      if (msg.language_code !== undefined || msg.lang !== undefined) {
+        const loc = normalizeExtensionLocale(msg.language_code ?? msg.lang);
+        patch.language_code = loc;
+        patch.lang = loc;
+      }
+      if (msg.font_size !== undefined) {
+        patch.font_size = clampFontSizePx(msg.font_size, 13);
+      }
+      if (msg.bubble_radius !== undefined) {
+        patch.bubble_radius = clampBubbleRadiusPx(msg.bubble_radius, 17);
+      }
+      if (typeof msg.accent_color === 'string' && /^#[0-9a-fA-F]{6}$/.test(msg.accent_color)) {
+        patch.accent_color = msg.accent_color;
+      }
+      if (typeof msg.passcode_enabled === 'boolean') {
+        patch.passcode_enabled = msg.passcode_enabled;
+      }
+      if (msg.passcode_hash !== undefined) {
+        patch.passcode_hash = msg.passcode_hash;
+      }
+      if (typeof msg.passcode_locked === 'boolean') {
+        patch.passcode_locked = msg.passcode_locked;
       }
       if (Object.keys(patch).length > 0) {
         await chrome.storage.local.set(patch);
       }
       await emitStateSnapshot();
       return { ok: true };
+    }
+
+    case 'ui.invoke_wasm': {
+      try {
+        await ensureWasmLoaded();
+        const out = await invokeWasm(
+          String(msg.op ?? ''),
+          msg.payload && typeof msg.payload === 'object' ? msg.payload : {},
+        );
+        return out as unknown as Record<string, unknown>;
+      } catch (err: any) {
+        return { ok: false, error: String(err?.message ?? err) };
+      }
     }
 
     case 'ui.invoke_browser_tool': {

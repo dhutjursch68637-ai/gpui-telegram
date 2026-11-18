@@ -466,17 +466,71 @@ export interface PendingBrowserCommandDto {
   source?: 'server' | 'local';
 }
 
+export type DesktopThemePreset = 'night' | 'tinted' | 'day' | 'classic';
+export type ExtensionLocale = 'zh-CN' | 'en-US';
+
+export function normalizeThemePreset(raw: unknown, fallbackMode?: unknown): DesktopThemePreset {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (s === 'night' || s === 'dark') return 'night';
+  if (s === 'tinted' || s === 'midnight') return 'tinted';
+  if (s === 'day' || s === 'light') return 'day';
+  if (s === 'classic') return 'classic';
+  const fm = String(fallbackMode ?? '').trim().toLowerCase();
+  if (fm === 'light' || fm === 'day') return 'day';
+  if (fm === 'classic') return 'classic';
+  if (fm === 'tinted') return 'tinted';
+  return 'night';
+}
+
+export function normalizeExtensionLocale(raw: unknown): ExtensionLocale {
+  const s = String(raw ?? '').trim().toLowerCase();
+  if (s.startsWith('zh')) return 'zh-CN';
+  return 'en-US';
+}
+
+export function clampFontSizePx(raw: unknown, fallback = 13): number {
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(20, Math.max(12, Math.round(n)));
+}
+
+export function clampBubbleRadiusPx(raw: unknown, fallback = 17): number {
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(18, Math.max(6, Math.round(n)));
+}
+
+export interface StoredAccountEntryDto {
+  user_id: number;
+  username: string;
+  token: string;
+  session_id?: string;
+  server_url: string;
+  first_name?: string;
+  active?: boolean;
+}
+
 export interface StoredDialogDto {
   chat_id: number;
   chat_type: string;
   title: string;
   peer_user_id?: number;
   peer_username?: string;
+  peer_phone?: string;
+  peer_bio?: string;
+  about?: string;
   is_bot?: boolean;
+  is_pinned?: boolean;
+  is_muted?: boolean;
+  is_archived?: boolean;
+  is_forum?: boolean;
+  is_verified?: boolean;
   unread_count: number;
   pts: number;
   last_message_id?: number;
   last_message_preview?: string;
+  pinned_message_id?: number | null;
+  pinned_message_preview?: string;
   updated_at_ms: number;
 }
 
@@ -500,12 +554,23 @@ export interface StoredMessageDto {
   message_id: number;
   sender_id: number;
   sender_username?: string;
+  sender_name?: string;
   text: string;
+  content?: Record<string, any> | null;
+  poll?: Record<string, any> | null;
+  reply_markup?: Record<string, any> | null;
+  inline_keyboard?: any[][] | null;
+  entities?: any[];
+  topic_id?: number | null;
   pts?: number;
   client_nonce?: string;
   created_at_ms: number;
   edited_at_ms?: number | null;
   reply_to_message_id?: number | null;
+  quote_text?: string | null;
+  forward_from_name?: string | null;
+  pinned?: boolean;
+  is_encrypted?: boolean;
   reactions?: StoredReactionDto[];
   thinking?: string;
   tool_steps?: StoredToolStepDto[];
@@ -519,6 +584,10 @@ export interface OutboxRecordDto {
   chat_id: number;
   text: string;
   reply_to_message_id?: number | null;
+  quote_text?: string | null;
+  topic_id?: number | null;
+  content?: Record<string, any> | null;
+  media_id?: string | null;
   created_at_ms: number;
   attempts: number;
 }
@@ -542,7 +611,15 @@ export interface ExtensionRuntimeStateSummary {
   bot_streaming: boolean;
   active_bot_run_id: string | null;
   theme_mode: 'dark' | 'light';
-  language_code: 'en' | 'ru';
+  theme_preset?: DesktopThemePreset;
+  font_size?: number;
+  bubble_radius?: number;
+  accent_color?: string;
+  language_code: 'en' | 'ru' | 'zh-CN' | 'en-US';
+  passcode_enabled?: boolean;
+  passcode_locked?: boolean;
+  accounts?: StoredAccountEntryDto[];
+  active_account_id?: number | string | null;
   wasm_ready: boolean;
 }
 

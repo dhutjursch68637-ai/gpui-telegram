@@ -29,6 +29,7 @@ import {
   dbGetMessagesForChat,
   dbListOutbox,
   dbRemoveOutbox,
+  dbReplaceServerDialogs,
   dbSaveSetting,
   dbSetChatPts,
   dbSetChatUnreadCount,
@@ -68,16 +69,25 @@ function parseTimestampMs(raw: unknown): number {
 }
 
 function extractMessageText(raw: Record<string, any>): string {
-  if (typeof raw.text === 'string') return raw.text;
+  if (typeof raw.text === 'string' && raw.text.length > 0) return raw.text;
   const content = raw.content;
   if (typeof content === 'string') return content;
   if (content && typeof content === 'object') {
-    if (typeof content.text === 'string') return content.text;
-    if (content.data && typeof content.data.text === 'string') return content.data.text;
-    if (content.data && typeof content.data.caption === 'string') return content.data.caption;
+    if (typeof content.text === 'string' && content.text.length > 0) return content.text;
+    const d = content.data && typeof content.data === 'object' ? content.data : content;
+    if (typeof d.text === 'string' && d.text.length > 0) return d.text;
+    if (typeof d.caption === 'string' && d.caption.length > 0) return d.caption;
+    if (typeof d.question === 'string' && d.question.length > 0) return d.question;
+    if (d.poll && typeof d.poll.question === 'string') return d.poll.question;
+    if (typeof d.title === 'string' && d.title.length > 0) return d.title;
+    if (typeof d.action_text === 'string' && d.action_text.length > 0) return d.action_text;
+    if (typeof d.action === 'string' && d.action.length > 0) return d.action;
+    if (typeof d.venue_title === 'string' && d.venue_title.length > 0) return d.venue_title;
     if (typeof content.caption === 'string') return content.caption;
   }
+  if (raw.poll && typeof raw.poll.question === 'string') return raw.poll.question;
   if (typeof raw.message === 'string') return raw.message;
+  if (typeof raw.text === 'string') return raw.text;
   return '';
 }
 
@@ -114,6 +124,113 @@ export function normalizeServerMessage(
       ? String(raw.client_nonce)
       : undefined;
 
+  const contentObj =
+    raw.content && typeof raw.content === 'object'
+      ? (raw.content as Record<string, any>)
+      : typeof raw.content_type === 'string' && raw.content_type.trim()
+        ? {
+            type:
+              raw.content_type.charAt(0).toUpperCase() + raw.content_type.slice(1),
+            data: raw,
+          }
+        : null;
+  const contentType = typeof contentObj?.type === 'string' ? contentObj.type : '';
+  const contentData =
+    contentObj?.data && typeof contentObj.data === 'object'
+      ? (contentObj.data as Record<string, any>)
+      : contentObj;
+
+  const pollObj =
+    (raw.poll && typeof raw.poll === 'object' ? raw.poll : null) ??
+    (contentData?.poll && typeof contentData.poll === 'object' ? contentData.poll : null) ??
+    (contentType === 'Poll' || contentType === 'Quiz' ? contentData : null);
+
+  const inlineKb =
+    Array.isArray(raw.inline_keyboard)
+      ? raw.inline_keyboard
+      : Array.isArray(raw.reply_markup?.inline_keyboard)
+        ? raw.reply_markup.inline_keyboard
+        : Array.isArray(contentData?.inline_keyboard)
+          ? contentData.inline_keyboard
+          : Array.isArray(contentData?.buttons)
+            ? contentData.buttons
+            : null;
+
+  const topicId = unwrapId(raw.topic_id ?? raw.reply_to_top_id ?? raw.thread_id);
+  const fullText = extractMessageText(raw);
+
+  // Extract server-streamed reasoning (`💭 **思考过程**\n> ...` or `<think>...</think>`) & `🔧 **执行步骤 (...)`
+  const extractedThinkingParts: string[] = [];
+  const rawReasoning = raw.thinking ?? raw.reasoning ?? raw.reasoning_content ?? contentData?.reasoning;
+  if (typeof rawReasoning === 'string' && rawReasoning.trim()) {
+    extractedThinkingParts.push(rawReasoning.trim());
+  }
+  const srvThinkRe = /💭\s*\*\*思考过程\*\*\r?\n((?:>[ \t]?[^\r\n]*(?:\r?\n|$))+)/g;
+  let tm: RegExpExecArray | null;
+  while ((tm = srvThinkRe.exec(fullText)) !== null) {
+    const cleaned = String(tm[1] ?? '')
+      .split(/\r?\n/)
+      .map((l) => l.replace(/^>[ \t]?/, ''))
+      .join('\n')
+      .trim();
+    if (cleaned) extractedThinkingParts.push(cleaned);
+  }
+  const tagThinkRe = /<think>([\s\S]*?)(?:<\/think>|$)/gi;
+  while ((tm = tagThinkRe.exec(fullText)) !== null) {
+    const cleaned = String(tm[1] ?? '').trim();
+    if (cleaned) extractedThinkingParts.push(cleaned);
+  }
+
+  const extractedSteps: Array<{
+    id: string;
+    tool: string;
+    args: Record<string, unknown>;
+    status: 'running' | 'done' | 'error';
+    result_summary?: string;
+  }> = [];
+  if (Array.isArray(raw.tool_steps)) {
+    for (const s of raw.tool_steps) {
+      const toolName = typeof s?.tool === 'string' ? s.tool : typeof s?.name === 'string' ? s.name : '';
+      if (s && typeof s === 'object' && toolName) {
+        const summary =
+          typeof s.result_summary === 'string'
+            ? s.result_summary
+            : typeof s.summary === 'string'
+              ? s.summary
+              : undefined;
+        extractedSteps.push({
+          id: String(s.id ?? `step-${extractedSteps.length + 1}`),
+          tool: toolName,
+          args: s.args && typeof s.args === 'object' ? s.args : {},
+          status: s.status === 'running' || s.status === 'error' ? s.status : 'done',
+          result_summary: summary,
+        });
+      }
+    }
+  }
+  const srvStepsRe =
+    /🔧\s*\*\*执行步骤\s*\(\d+\/\d+\)\*\*\r?\n((?:(?:\d+\.\s*[⏳✅❌][^\r\n]*|…已折叠[^\r\n]*)(?:\r?\n|$))+)/g;
+  let sm: RegExpExecArray | null;
+  while ((sm = srvStepsRe.exec(fullText)) !== null) {
+    const lines = String(sm[1] ?? '').split(/\r?\n/);
+    for (const ln of lines) {
+      const stepMatch = /^(\d+)\.\s*([⏳✅❌])\s*`([^`]+)`(.*)$/.exec(ln.trim());
+      if (stepMatch) {
+        const idxStr = stepMatch[1]!;
+        const icon = stepMatch[2]!;
+        const toolName = stepMatch[3]!;
+        const rest = String(stepMatch[4] ?? '').trim();
+        extractedSteps.push({
+          id: `srv-step-${messageId}-${idxStr}`,
+          tool: toolName,
+          args: {},
+          status: icon === '⏳' ? 'running' : icon === '❌' ? 'error' : 'done',
+          result_summary: rest || undefined,
+        });
+      }
+    }
+  }
+
   return {
     chat_id: chatId,
     message_id: messageId,
@@ -124,7 +241,24 @@ export function normalizeServerMessage(
         : typeof raw.username === 'string'
           ? raw.username
           : undefined,
-    text: extractMessageText(raw),
+    sender_name:
+      typeof raw.sender_name === 'string'
+        ? raw.sender_name
+        : typeof raw.from_name === 'string'
+          ? raw.from_name
+          : undefined,
+    text: fullText,
+    content: contentObj,
+    poll: pollObj,
+    reply_markup:
+      raw.reply_markup && typeof raw.reply_markup === 'object' ? raw.reply_markup : null,
+    inline_keyboard: inlineKb,
+    entities: Array.isArray(raw.entities)
+      ? raw.entities
+      : Array.isArray(contentData?.entities)
+        ? contentData.entities
+        : undefined,
+    topic_id: topicId !== null && topicId > 0 ? topicId : null,
     pts: pts && pts > 0 ? pts : undefined,
     client_nonce: clientNonce,
     created_at_ms: parseTimestampMs(raw.created_at_ms ?? raw.created_at ?? raw.date),
@@ -134,7 +268,25 @@ export function normalizeServerMessage(
         : null,
     reply_to_message_id:
       unwrapId(raw.reply_to_message_id ?? raw.reply_to?.reply_to_msg_id ?? raw.reply_to) ?? null,
+    quote_text:
+      typeof raw.quote_text === 'string'
+        ? raw.quote_text
+        : typeof raw.reply_to?.quote_text === 'string'
+          ? raw.reply_to.quote_text
+          : null,
+    forward_from_name:
+      typeof raw.forward_from_name === 'string'
+        ? raw.forward_from_name
+        : typeof raw.fwd_from?.from_name === 'string'
+          ? raw.fwd_from.from_name
+          : null,
+    pinned: Boolean(raw.pinned ?? raw.is_pinned),
+    is_encrypted: Boolean(
+      raw.is_encrypted || contentType === 'Encrypted' || raw.e2ee_ciphertext,
+    ),
     reactions: extractReactions(raw.reactions),
+    thinking: extractedThinkingParts.length > 0 ? extractedThinkingParts.join('\n\n') : undefined,
+    tool_steps: extractedSteps.length > 0 ? extractedSteps : undefined,
     pending_outbox: false,
   };
 }
@@ -152,6 +304,7 @@ export function normalizeServerDialog(raw: Record<string, any>): StoredDialogDto
 
   const title =
     (typeof raw.title === 'string' && raw.title.trim()) ||
+    (typeof raw.peer_display_name === 'string' && raw.peer_display_name.trim()) ||
     (typeof raw.display_name === 'string' && raw.display_name.trim()) ||
     (peerUsername ? `@${peerUsername}` : `Chat #${chatId}`);
 
@@ -159,9 +312,11 @@ export function normalizeServerDialog(raw: Record<string, any>): StoredDialogDto
   const lastPreview =
     typeof raw.last_message_preview === 'string'
       ? raw.last_message_preview
-      : lastMsg
-        ? extractMessageText(lastMsg)
-        : undefined;
+      : typeof raw.latest_message_text === 'string'
+        ? raw.latest_message_text
+        : lastMsg
+          ? extractMessageText(lastMsg)
+          : undefined;
 
   const peerUserId = unwrapId(raw.peer_user_id ?? raw.peer_id ?? raw.bot_user_id) ?? undefined;
 
@@ -171,11 +326,24 @@ export function normalizeServerDialog(raw: Record<string, any>): StoredDialogDto
     title,
     peer_user_id: peerUserId,
     peer_username: peerUsername,
-    is_bot: Boolean(raw.is_bot || peerUserId === OFFICIAL_BOT_USER_ID || /bot/i.test(peerUsername ?? '')),
+    peer_phone: typeof raw.peer_phone === 'string' ? raw.peer_phone : undefined,
+    peer_bio: typeof raw.peer_bio === 'string' ? raw.peer_bio : undefined,
+    about: typeof raw.about === 'string' ? raw.about : undefined,
+    is_bot: Boolean(
+      raw.is_bot || peerUserId === OFFICIAL_BOT_USER_ID || /bot/i.test(peerUsername ?? ''),
+    ),
+    is_pinned: Boolean(raw.is_pinned ?? raw.pinned),
+    is_muted: Boolean(raw.is_muted ?? raw.muted),
+    is_archived: Boolean(raw.is_archived ?? raw.archived),
+    is_forum: Boolean(raw.is_forum),
+    is_verified: Boolean(raw.is_verified),
     unread_count: Math.max(0, Number(raw.unread_count ?? 0) || 0),
     pts: Math.max(0, Number(raw.pts ?? lastMsg?.pts ?? 0) || 0),
     last_message_id: unwrapId(raw.last_message_id ?? lastMsg?.message_id ?? lastMsg?.id) ?? undefined,
     last_message_preview: lastPreview,
+    pinned_message_id: unwrapId(raw.pinned_message_id ?? raw.pinned_msg_id) ?? null,
+    pinned_message_preview:
+      typeof raw.pinned_message_preview === 'string' ? raw.pinned_message_preview : undefined,
     updated_at_ms: parseTimestampMs(
       raw.updated_at_ms ?? raw.updated_at ?? lastMsg?.date ?? Date.now(),
     ),
@@ -459,7 +627,7 @@ export class ExtensionSyncEngine {
         }
       }
 
-      await dbUpsertDialogs(normalized);
+      await dbReplaceServerDialogs(normalized);
 
       for (const dlg of normalized) {
         this.subscribeChatOnWs(dlg.chat_id);
@@ -842,10 +1010,16 @@ export class ExtensionSyncEngine {
     chatId: number;
     text: string;
     replyToMessageId?: number | null;
+    quoteText?: string | null;
+    topicId?: number | null;
+    content?: Record<string, any> | null;
+    mediaId?: string | null;
     clientNonce?: string;
   }): Promise<{ ok: boolean; queued?: boolean; message?: StoredMessageDto; error?: string }> {
     const text = params.text.trim();
-    if (!text) return { ok: false, error: 'Empty message text' };
+    if (!text && !params.content && !params.mediaId) {
+      return { ok: false, error: 'Empty message text' };
+    }
 
     const clientNonce =
       params.clientNonce ||
@@ -860,10 +1034,13 @@ export class ExtensionSyncEngine {
       message_id: optimisticTempId,
       sender_id: cfg.userId ?? 0,
       sender_username: cfg.username ?? 'me',
-      text,
+      text: text || (params.content?.type ? `[${params.content.type}]` : '[Media]'),
+      content: params.content ?? null,
+      topic_id: params.topicId ?? null,
       client_nonce: clientNonce,
       created_at_ms: Date.now(),
       reply_to_message_id: params.replyToMessageId ?? null,
+      quote_text: params.quoteText ?? null,
       pending_outbox: true,
     };
 
@@ -873,6 +1050,10 @@ export class ExtensionSyncEngine {
       chat_id: params.chatId,
       text,
       reply_to_message_id: params.replyToMessageId ?? null,
+      quote_text: params.quoteText ?? null,
+      topic_id: params.topicId ?? null,
+      content: params.content ?? null,
+      media_id: params.mediaId ?? null,
       created_at_ms: Date.now(),
       attempts: 0,
     };
@@ -933,6 +1114,7 @@ export class ExtensionSyncEngine {
     if (!cfg.serverUrl || !cfg.token) return null;
 
     try {
+      const numericNonce = Number(item.client_nonce);
       const resp = await fetch(`${cfg.serverUrl}/api/v1/messages/send`, {
         method: 'POST',
         headers: {
@@ -942,9 +1124,14 @@ export class ExtensionSyncEngine {
         },
         body: JSON.stringify({
           chat_id: item.chat_id,
-          text: item.text,
-          client_nonce: item.client_nonce,
+          text: item.text || undefined,
+          content: item.content ?? undefined,
+          media_id: item.media_id ?? undefined,
+          client_nonce: Number.isSafeInteger(numericNonce) ? numericNonce : item.client_nonce,
+          reply_to: item.reply_to_message_id ?? undefined,
           reply_to_message_id: item.reply_to_message_id ?? undefined,
+          quote_text: item.quote_text ?? undefined,
+          topic_id: item.topic_id ?? undefined,
         }),
       });
 
@@ -967,6 +1154,7 @@ export class ExtensionSyncEngine {
             ...msgPayload,
             chat_id: msgPayload.chat_id ?? item.chat_id,
             text: extractMessageText(msgPayload) || item.text,
+            topic_id: msgPayload.topic_id ?? item.topic_id,
             client_nonce: item.client_nonce,
           },
           item.chat_id,
@@ -975,6 +1163,7 @@ export class ExtensionSyncEngine {
           message_id: Math.abs(Date.now() % 1_000_000_000),
           sender_id: cfg.userId ?? 0,
           text: item.text,
+          topic_id: item.topic_id ?? null,
           client_nonce: item.client_nonce,
           created_at_ms: item.created_at_ms,
           pending_outbox: false,
@@ -987,6 +1176,18 @@ export class ExtensionSyncEngine {
 
       const chatMessages = await dbGetMessagesForChat(item.chat_id, 200);
       this.broadcast({ type: 'messages_updated', chat_id: item.chat_id, messages: chatMessages });
+
+      // Ensure bot slash command or AI responses appear promptly even if WS push races
+      const dlg = await dbGetDialog(item.chat_id).catch(() => undefined);
+      if (item.text.startsWith('/') || dlg?.is_bot || item.chat_id >= 700_000_000) {
+        setTimeout(() => {
+          void this.fetchChatHistory(item.chat_id, 60);
+        }, 350);
+        setTimeout(() => {
+          void this.fetchChatHistory(item.chat_id, 60);
+        }, 1200);
+      }
+
       return confirmed;
     } catch {
       return null;
