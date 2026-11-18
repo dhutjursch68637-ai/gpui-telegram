@@ -1,0 +1,86 @@
+{
+  "manifest_version": 3,
+  "name": "GPUI Telegram Messenger & Browser Copilot",
+  "short_name": "GPUI Telegram",
+  "version": "0.1.0",
+  "description": "Full-featured Telegram Messenger, Side-Panel AI Copilot, and 24-tool Browser Automation Bridge powered by Rust + WebAssembly.",
+  "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqs4zfeG0IUm63UFI8NAxwuOT9aUnPRuARNhOOKNteDE0qgZ29J36k/VuqrzY5qtqnvbuHf6h8wH5n3VtQGnVD2ebsWbsqzmLTmJsH2DHyFnNJWW1RGwOBZ/LcuwPwLfBBDPfWdUmxWBTtNmBAIaZlzfdnWciqnhYrgF4w2b+PZ0UPG9lUqO2APistkFyyuIdAfcAobK2zcINipJatdm/2A+O0kXmecM+Bye67+8680MdsRqaP2hY5wdnSiVgvCXvj2zcELU0X9FfUPXEtSFIMshj0djKukMd1sgVqIbiXceGIjPIcUgvOcxIHE6nfHf600tu46bWiohppdvEZLqkWwIDAQAB",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_title": "GPUI Telegram",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "options_page": "options.html",
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "debugger",
+    "activeTab",
+    "storage",
+    "unlimitedStorage",
+    "alarms",
+    "notifications",
+    "sidePanel",
+    "cookies",
+    "downloads",
+    "contextMenus"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "commands": {
+    "open-side-panel": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Open GPUI Telegram Side Panel"
+    },
+    "emergency-stop-bot": {
+      "suggested_key": {
+        "default": "Alt+Shift+S",
+        "mac": "Alt+Shift+S"
+      },
+      "description": "Emergency stop all active bot browser control"
+    }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/gpui_telegram_ext_wasm.wasm", "icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}

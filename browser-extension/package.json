@@ -1,0 +1,26 @@
+{
+  "name": "@gpui-telegram/browser-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GPUI Telegram Chrome/Chromium Manifest V3 Browser Extension with Rust->WASM core and 24-tool BrowserController",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "clean": "node -e \"import('node:fs').then(fs => fs.rmSync('dist', { recursive: true, force: true }))\""
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/node": "^22.15.0",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "esbuild": "^0.25.0",
+    "typescript": "~5.8.3",
+    "vite": "^6.2.0"
+  }
+}
