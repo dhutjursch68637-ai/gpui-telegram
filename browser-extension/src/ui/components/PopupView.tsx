@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   CANONICAL_TEST_IDS,
   LOCAL_COPILOT_CHAT_ID,
@@ -10,7 +10,7 @@ import {
   type StoredDialogDto,
   type StoredMessageDto,
 } from '../../shared/rpc_types';
-import { tr } from '../i18n/translations';
+import { tr, type TranslationKey } from '../i18n/translations';
 import { sendSwRpc } from '../sw_client';
 import { PendingApprovalBannerList } from './ConversationStage';
 
@@ -41,9 +41,10 @@ export function PopupView({
 }) {
   const [summarizing, setSummarizing] = useState(false);
   const [quickPrompt, setQuickPrompt] = useState('');
+  const quickInputRef = useRef<HTMLInputElement | null>(null);
 
   const isStopped = state.emergency_stopped || state.run_policy === 'disabled';
-  const bridgeStatusLabel = isStopped
+  const baseStatusLabel = isStopped
     ? tr(locale, 'bridge.stopped')
     : state.server_relay_connected && state.desktop_bridge_connected
       ? `${tr(locale, 'bridge.online')} (Relay+Desktop)`
@@ -52,6 +53,8 @@ export function PopupView({
         : state.desktop_bridge_connected
           ? tr(locale, 'bridge.desktop')
           : tr(locale, 'bridge.online');
+  const policyLabel = tr(locale, `policy.${state.run_policy}` as TranslationKey);
+  const bridgeStatusLabel = isStopped ? baseStatusLabel : `${baseStatusLabel} · ${policyLabel}`;
 
   const handleSummarizeTab = async () => {
     setSummarizing(true);
@@ -74,9 +77,10 @@ export function PopupView({
 
   const handleQuickSend = async (e: React.FormEvent) => {
     e.preventDefault();
-    const q = quickPrompt.trim();
+    const q = (quickInputRef.current?.value ?? quickPrompt).trim();
     if (!q) return;
     setQuickPrompt('');
+    if (quickInputRef.current) quickInputRef.current.value = '';
     await sendSwRpc({
       type: 'ui.send_message',
       surface: 'sidepanel',
@@ -168,6 +172,7 @@ export function PopupView({
 
       <form className="row-gap-6" onSubmit={(e) => void handleQuickSend(e)}>
         <input
+          ref={quickInputRef}
           className="input sm flex-1"
           data-testid="popup-quick-prompt-input"
           value={quickPrompt}

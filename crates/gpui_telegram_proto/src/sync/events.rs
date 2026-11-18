@@ -43,7 +43,9 @@ impl TypingEvent {
 pub struct ReadHistoryEvent {
     pub chat_id: ChatId,
     pub max_id: MessageId,
+    #[serde(default)]
     pub is_outbox: bool,
+    #[serde(default)]
     pub unread_count: u32,
 }
 

@@ -962,6 +962,7 @@ impl DesktopBrowserBridge {
                 arguments,
                 caller,
                 timeout_ms,
+                approved: true,
             },
         );
         let raw_frame = match frame.to_json_string() {
@@ -1649,6 +1650,10 @@ async fn handle_extension_ws(
                 }
 
                 let now_ms = Utc::now().timestamp_millis();
+                *bridge.run_policy.write() = params.run_policy;
+                if params.run_policy != BrowserRunPolicy::Disabled {
+                    bridge.emergency_stopped.store(false, Ordering::Release);
+                }
                 let sess = if let Some(existing) = registered_session.as_ref() {
                     *existing.extension_id.write() = params.extension_id;
                     *existing.device_id.write() = params.device_id;
@@ -1702,6 +1707,10 @@ async fn handle_extension_ws(
                 sess.last_seen_ms
                     .store(Utc::now().timestamp_millis().max(0) as u64, Ordering::Relaxed);
                 *sess.reported_policy.write() = params.run_policy;
+                *bridge.run_policy.write() = params.run_policy;
+                if params.run_policy != BrowserRunPolicy::Disabled {
+                    bridge.emergency_stopped.store(false, Ordering::Release);
+                }
                 *sess.tabs.write() = params.tabs;
                 bridge.bump_tabs_notify();
             }
@@ -1954,6 +1963,27 @@ async fn connect_ws_bypassing_proxy_for_loopback(ws_url: &str) -> Result<Upstrea
     ws_cfg.max_message_size = Some(MAX_BROWSER_WS_FRAME_BYTES);
     ws_cfg.max_frame_size = Some(MAX_BROWSER_WS_FRAME_BYTES);
 
+    if let Some(rest) = ws_url.strip_prefix("ws://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        let addr = if authority.contains(':') {
+            authority.to_string()
+        } else {
+            format!("{authority}:80")
+        };
+        let tcp = tokio::net::TcpStream::connect(&addr)
+            .await
+            .map_err(|e| format!("Upstream TCP connect to {addr} failed: {e}"))?;
+        let _ = tcp.set_nodelay(true);
+        let (stream, _) = tokio_tungstenite::client_async_with_config(
+            ws_url,
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp),
+            Some(ws_cfg),
+        )
+        .await
+        .map_err(|e| format!("Upstream WS handshake failed: {e}"))?;
+        return Ok(stream);
+    }
+
     let (stream, _) =
         tokio_tungstenite::connect_async_with_config(ws_url, Some(ws_cfg), false)
             .await
@@ -1983,6 +2013,7 @@ async fn run_upstream_ws_loop(
             capabilities: vec!["desktop_loopback_bridge".to_string(), "cdp_fallback".to_string()],
             run_policy: snap.run_policy,
             tabs_summary: snap.tabs,
+            desktop_bridge_connected: true,
         },
     };
     if let Ok(raw) = hello.to_json_string() {
@@ -2011,6 +2042,7 @@ async fn run_upstream_ws_loop(
                 let sync_frame = BrowserBridgeFrame::tabs_sync(BridgeTabsSyncParams {
                     tabs: cur.tabs,
                     run_policy: cur.run_policy,
+                    desktop_bridge_connected: true,
                 });
                 if let Ok(raw) = sync_frame.to_json_string() {
                     let _ = tx.send(raw);
@@ -2049,7 +2081,7 @@ async fn run_upstream_ws_loop(
                         }
                     }
                     BrowserBridgeFrame::EmergencyStop { params, .. } => {
-                        bridge.trigger_emergency_stop(params.reason);
+                        bridge.trigger_emergency_stop_internal(params.reason, false);
                     }
                     BrowserBridgeFrame::Invoke { id, params } => {
                         let bridge_clone = Arc::clone(bridge);
@@ -2108,6 +2140,7 @@ pub fn run_headless_browser_bridge_daemon(args: &[String]) -> Result<(), String>
     let start_opts = DesktopBrowserBridgeStartOptions::from_env_and_args(args);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .map_err(|e| format!("Failed to initialize Tokio runtime for Desktop Bridge: {e}"))?;

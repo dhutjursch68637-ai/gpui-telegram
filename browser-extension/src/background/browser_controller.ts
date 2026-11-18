@@ -138,6 +138,9 @@ export class BrowserController {
   /** Active cancellable operations (aborted immediately on tab close or emergency stop). */
   private activeOps = new Set<PendingOpHandle>();
 
+  /** Tracks the most recently active controllable web tab so sidepanel/extension focus does not fall back to Tab 0 (about:blank). */
+  private lastActiveControllableTabId: number | null = null;
+
   constructor(
     policy: BrowserPolicyEngine,
     bridgeStatusProvider: () => {
@@ -154,7 +157,21 @@ export class BrowserController {
   }
 
   public installChromeListeners(): void {
+    chrome.tabs.onActivated.addListener((activeInfo) => {
+      chrome.tabs
+        .get(activeInfo.tabId)
+        .then((tab) => {
+          if (tab && typeof tab.id === 'number' && !isRestrictedTabUrl(tab.url || tab.pendingUrl)) {
+            this.lastActiveControllableTabId = tab.id;
+          }
+        })
+        .catch(() => {});
+    });
+
     chrome.tabs.onRemoved.addListener((tabId) => {
+      if (this.lastActiveControllableTabId === tabId) {
+        this.lastActiveControllableTabId = null;
+      }
       this.tabRefFrames.delete(tabId);
       this.telemetry.delete(tabId);
       this.policy.clearTabState(tabId);
@@ -175,9 +192,13 @@ export class BrowserController {
       }
     });
 
-    chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       if (changeInfo.url) {
         this.policy.clearTabState(tabId, changeInfo.url);
+      }
+      const nextUrl = changeInfo.url || tab?.url || '';
+      if (tab?.active && nextUrl && !isRestrictedTabUrl(nextUrl)) {
+        this.lastActiveControllableTabId = tabId;
       }
     });
 
@@ -413,9 +434,53 @@ export class BrowserController {
   private async resolveDefaultControllableTab(): Promise<chrome.tabs.Tab> {
     const activeInLastFocused = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     const candidate = activeInLastFocused.find((t) => !isRestrictedTabUrl(t.url));
-    if (candidate) return candidate;
+    if (candidate && typeof candidate.id === 'number') {
+      const candUrl = candidate.url || candidate.pendingUrl || '';
+      if (/^https?:/i.test(candUrl)) {
+        this.lastActiveControllableTabId = candidate.id;
+        return candidate;
+      }
+    }
 
     const allTabs = await chrome.tabs.query({});
+    const isHttpControllable = (t: chrome.tabs.Tab) =>
+      typeof t.id === 'number' &&
+      !isRestrictedTabUrl(t.url) &&
+      /^https?:/i.test(t.url || t.pendingUrl || '');
+
+    // If the currently active tab is a restricted page (e.g., chrome-extension:// sidepanel.html or workspace.html),
+    // prefer the most recently active/accessed controllable HTTP(S) tab over initial Tab 0 (about:blank).
+    if (!candidate) {
+      if (this.lastActiveControllableTabId !== null) {
+        const rememberedHttp = allTabs.find(
+          (t) => t.id === this.lastActiveControllableTabId && isHttpControllable(t),
+        );
+        if (rememberedHttp) return rememberedHttp;
+      }
+
+      const activeHttp = allTabs.find((t) => t.active && isHttpControllable(t));
+      if (activeHttp) return activeHttp;
+
+      const httpTabs = allTabs.filter(isHttpControllable);
+      if (httpTabs.length > 0) {
+        httpTabs.sort((a, b) => {
+          const accDiff = ((b as any).lastAccessed ?? 0) - ((a as any).lastAccessed ?? 0);
+          if (accDiff !== 0) return accDiff;
+          return (b.index ?? 0) - (a.index ?? 0);
+        });
+        return httpTabs[0]!;
+      }
+
+      if (this.lastActiveControllableTabId !== null) {
+        const rememberedAny = allTabs.find(
+          (t) => t.id === this.lastActiveControllableTabId && !isRestrictedTabUrl(t.url),
+        );
+        if (rememberedAny) return rememberedAny;
+      }
+    } else {
+      return candidate;
+    }
+
     const anyControllable =
       allTabs.find((t) => t.active && !isRestrictedTabUrl(t.url)) ??
       allTabs.find((t) => !isRestrictedTabUrl(t.url)) ??
@@ -554,10 +619,26 @@ export class BrowserController {
           { tab_id: tabId },
         );
       }
+      const errMsg = String(err?.message ?? err);
+      if (
+        (action === 'click' || action === 'type' || action === 'press_key') &&
+        /message port closed|back\/forward cache|receiving end does not exist|frame.*removed/i.test(
+          errMsg,
+        )
+      ) {
+        const settled = await this.waitForTabComplete(tabId, 6_000, 'complete').catch(() => alive);
+        return {
+          ok: true,
+          navigated: true,
+          will_navigate: true,
+          url_after: settled?.url || alive.url || '',
+          title_after: settled?.title || alive.title || '',
+        };
+      }
       throw new BrowserRpcError(
         BRIDGE_ERROR_CODES.INTERNAL_ERROR,
         'INTERNAL_ERROR',
-        `Failed messaging content script on tab ${tabId} (frame ${frameId}): ${String(err?.message ?? err)}`,
+        `Failed messaging content script on tab ${tabId} (frame ${frameId}): ${errMsg}`,
       );
     }
 
@@ -743,6 +824,10 @@ export class BrowserController {
       );
     }
 
+    if (!isRestrictedTabUrl(url)) {
+      this.lastActiveControllableTabId = created.id;
+    }
+
     let groupId: number | null = null;
     if (args.group_with_bot && chrome.tabs.group) {
       try {
@@ -770,6 +855,9 @@ export class BrowserController {
 
   private async toolActivateTab(args: Record<string, unknown>): Promise<Record<string, unknown>> {
     const tab = await this.getTabOrThrow(Number(args.tab_id));
+    if (typeof tab.id === 'number' && !isRestrictedTabUrl(tab.url || tab.pendingUrl)) {
+      this.lastActiveControllableTabId = tab.id;
+    }
     const updated = await chrome.tabs.update(tab.id!, { active: true });
     if (updated?.windowId) {
       await chrome.windows.update(updated.windowId, { focused: true }).catch(() => {});
@@ -901,6 +989,7 @@ export class BrowserController {
     const tabId = this.assertTabControllable(tab);
     const direction = String(args.direction ?? 'back').toLowerCase();
     const timeoutMs = typeof args.timeout_ms === 'number' ? args.timeout_ms : 10_000;
+    const beforeUrl = tab.url ?? '';
 
     if (direction === 'forward') {
       await chrome.tabs.goForward(tabId);
@@ -908,14 +997,49 @@ export class BrowserController {
       await chrome.tabs.goBack(tabId);
     }
 
-    await new Promise((r) => setTimeout(r, 60));
-    const loaded = await this.waitForTabComplete(tabId, timeoutMs, 'complete');
+    const waitBudget = Math.min(Math.max(timeoutMs, 800), 3_000);
+    const deadline = Date.now() + waitBudget;
+    let fallbackTriggered = false;
+    let latestTab: chrome.tabs.Tab = tab;
+
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      try {
+        latestTab = await chrome.tabs.get(tabId);
+      } catch {
+        break;
+      }
+      const curUrl = latestTab.url ?? '';
+      if (curUrl && curUrl !== beforeUrl && latestTab.status === 'complete') {
+        break;
+      }
+      if (!fallbackTriggered && Date.now() + waitBudget - deadline >= 450 && curUrl === beforeUrl) {
+        fallbackTriggered = true;
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            func: (dir: string) => {
+              if (dir === 'forward') {
+                window.history.forward();
+              } else {
+                window.history.back();
+              }
+            },
+            args: [direction],
+          });
+        } catch {
+          // ignore scripting fallback error on restricted pages
+        }
+      }
+    }
+
+    const loaded = await this.waitForTabComplete(tabId, Math.max(500, timeoutMs - 500), 'complete');
     return {
       ok: true,
       tab_id: tabId,
       direction,
-      url: loaded.url ?? '',
-      title: loaded.title ?? '',
+      url: loaded.url ?? latestTab.url ?? '',
+      title: loaded.title ?? latestTab.title ?? '',
     };
   }
 
@@ -1102,7 +1226,13 @@ export class BrowserController {
     const tab = preTab ?? (await this.resolveDefaultControllableTab());
     const tabId = this.assertTabControllable(tab);
     const res = await this.sendDomActionAcrossFrames(tabId, 'click', args);
-    const latestTab = await chrome.tabs.get(tabId).catch(() => tab);
+    if (res.will_navigate) {
+      await new Promise((r) => setTimeout(r, 35));
+    }
+    let latestTab = await chrome.tabs.get(tabId).catch(() => tab);
+    if (latestTab && (latestTab.status === 'loading' || Boolean(latestTab.pendingUrl))) {
+      latestTab = await this.waitForTabComplete(tabId, 8_000, 'complete').catch(() => latestTab);
+    }
     return {
       ...res,
       tab_id: tabId,
@@ -1128,6 +1258,13 @@ export class BrowserController {
     const tab = preTab ?? (await this.resolveDefaultControllableTab());
     const tabId = this.assertTabControllable(tab);
     const res = await this.sendDomActionAcrossFrames(tabId, 'type', args);
+    if (res.will_navigate) {
+      await new Promise((r) => setTimeout(r, 35));
+      const checkTab = await chrome.tabs.get(tabId).catch(() => null);
+      if (checkTab && (checkTab.status === 'loading' || Boolean(checkTab.pendingUrl))) {
+        await this.waitForTabComplete(tabId, 8_000, 'complete').catch(() => null);
+      }
+    }
     return { ...res, tab_id: tabId };
   }
 

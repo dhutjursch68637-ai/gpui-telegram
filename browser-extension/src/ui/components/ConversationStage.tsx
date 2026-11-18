@@ -121,7 +121,7 @@ export function BridgeHeaderControls({
   onEmergencyStop: () => void;
 }) {
   const isStopped = state.emergency_stopped || state.run_policy === 'disabled';
-  const statusText = isStopped
+  const baseStatusText = isStopped
     ? tr(locale, 'bridge.stopped')
     : state.server_relay_connected && state.desktop_bridge_connected
       ? `${tr(locale, 'bridge.online')} (Relay+Desktop)`
@@ -130,6 +130,8 @@ export function BridgeHeaderControls({
         : state.desktop_bridge_connected
           ? tr(locale, 'bridge.desktop')
           : tr(locale, 'bridge.online');
+  const policyText = tr(locale, `policy.${state.run_policy}` as any);
+  const statusText = isStopped ? baseStatusText : `${baseStatusText} · ${policyText}`;
 
   return (
     <div className={`bridge-controls-bar ${compact ? 'compact' : ''}`}>
@@ -239,8 +241,9 @@ export function ConversationStage({
     }
   }, [messages.length, chatId]);
 
-  // Resolve pinned message banner
+  // Resolve pinned message banner (check local messages, dialog summary, and server /pins endpoint)
   useEffect(() => {
+    let cancelled = false;
     const fromLocal = [...messages].reverse().find((m) => m.pinned);
     if (fromLocal) {
       setPinnedBannerMsg(fromLocal);
@@ -257,8 +260,69 @@ export function ConversationStage({
       });
       return;
     }
+    if (chatId > 0 && state.authenticated) {
+      const syncPinsFromServer = () => {
+        void apiRequest<any>(`/api/v1/chats/${chatId}/pins`).then((res) => {
+          if (cancelled) return;
+          if (res.ok && res.data) {
+            const pinList = Array.isArray(res.data?.pinned_message_ids)
+              ? res.data.pinned_message_ids
+              : Array.isArray(res.data?.pinned_ids)
+                ? res.data.pinned_ids
+                : Array.isArray(res.data?.pins)
+                  ? res.data.pins
+                  : Array.isArray(res.data?.messages)
+                    ? res.data.messages
+                    : Array.isArray(res.data)
+                      ? res.data
+                      : [];
+            const latestPin = pinList[pinList.length - 1] ?? pinList[0];
+            if (latestPin !== undefined && latestPin !== null) {
+              const pinMsgId = Number(
+                typeof latestPin === 'object'
+                  ? (latestPin.message_id ?? latestPin.id ?? latestPin[0])
+                  : latestPin,
+              );
+              const matched = messages.find((m) => m.message_id === pinMsgId);
+              if (matched) {
+                setPinnedBannerMsg({ ...matched, pinned: true });
+                return;
+              }
+              if (Number.isFinite(pinMsgId) && pinMsgId > 0) {
+                setPinnedBannerMsg({
+                  chat_id: chatId,
+                  message_id: pinMsgId,
+                  sender_id: Number(latestPin?.sender_id ?? 0),
+                  text: String(latestPin?.text ?? latestPin?.preview ?? `Message #${pinMsgId}`),
+                  created_at_ms: Date.now(),
+                  pinned: true,
+                });
+                return;
+              }
+            }
+          }
+          setPinnedBannerMsg(null);
+        });
+      };
+
+      syncPinsFromServer();
+      const pollId = window.setInterval(syncPinsFromServer, 900);
+      return () => {
+        cancelled = true;
+        window.clearInterval(pollId);
+      };
+    }
     setPinnedBannerMsg(null);
-  }, [activeDialog?.pinned_message_id, activeDialog?.pinned_message_preview, chatId, messages]);
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeDialog?.pinned_message_id,
+    activeDialog?.pinned_message_preview,
+    chatId,
+    messages,
+    state.authenticated,
+  ]);
 
   const filteredMessages = useMemo(() => {
     let list = messages;
@@ -271,6 +335,27 @@ export function ConversationStage({
     }
     return list;
   }, [inChatQuery, messages, selectedTopicId]);
+
+  const { latestThinkingKey, latestToolStepsKey } = useMemo(() => {
+    let lastThink: string | null = null;
+    let lastTools: string | null = null;
+    filteredMessages.forEach((m, i) => {
+      const k = `${m.chat_id}:${m.message_id}:${m.client_nonce ?? i}`;
+      const txt = m.text ?? '';
+      const hasThink = Boolean(
+        (m.thinking && m.thinking.trim()) ||
+          /<think>[\s\S]*?<\/think>/i.test(txt) ||
+          (m.tool_steps && m.tool_steps.length > 0),
+      );
+      const hasTools = Boolean(
+        (m.tool_steps && m.tool_steps.length > 0) ||
+          /\[tool:(?:call|step|done)|🔧\s*`?[a-z0-9_]+`?/i.test(txt),
+      );
+      if (hasThink) lastThink = k;
+      if (hasTools) lastTools = k;
+    });
+    return { latestThinkingKey: lastThink, latestToolStepsKey: lastTools };
+  }, [filteredMessages]);
 
   const messageMap = useMemo(() => {
     const m = new Map<number, StoredMessageDto>();
@@ -484,7 +569,8 @@ export function ConversationStage({
               <button
                 type="button"
                 className="btn ghost icon-sm"
-                data-testid="stage-talk-mode-btn"
+                data-testid="stage-voice-talk-btn"
+                aria-label="Talk Mode"
                 title={tr(locale, 'stage.talkMode')}
                 onClick={onStartTalkMode}
               >
@@ -592,9 +678,10 @@ export function ConversationStage({
             const replyTarget = msg.reply_to_message_id
               ? messageMap.get(msg.reply_to_message_id)?.text
               : undefined;
+            const rowKey = `${msg.chat_id}:${msg.message_id}:${msg.client_nonce ?? idx}`;
 
             return (
-              <React.Fragment key={`${msg.chat_id}:${msg.message_id}:${msg.client_nonce ?? idx}`}>
+              <React.Fragment key={rowKey}>
                 {showDateHeader && (
                   <div className="sticky-date-pill" data-testid="transcript-date-pill">
                     {dayLabel}
@@ -604,6 +691,8 @@ export function ConversationStage({
                   msg={msg}
                   isMine={isMine}
                   locale={locale}
+                  isLatestThinking={rowKey === latestThinkingKey}
+                  isLatestToolSteps={rowKey === latestToolStepsKey}
                   replyTargetPreview={replyTarget}
                   translatedText={translations[msg.message_id]}
                   onReply={(target) => {

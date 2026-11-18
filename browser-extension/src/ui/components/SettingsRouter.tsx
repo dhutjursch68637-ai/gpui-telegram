@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   CANONICAL_TEST_IDS,
   type BrowserRunPolicy,
@@ -129,6 +129,8 @@ export function SettingsRouter({
 
   // Passcode state
   const [newPin, setNewPin] = useState('');
+  const [localPasscodeEnabled, setLocalPasscodeEnabled] = useState(state.passcode_enabled);
+  const pinInputRef = useRef<HTMLInputElement | null>(null);
 
   // 2FA state
   const [twoFaPassword, setTwoFaPassword] = useState('');
@@ -142,6 +144,10 @@ export function SettingsRouter({
   const [providerApiKey, setProviderApiKey] = useState('');
   const [magpieUri, setMagpieUri] = useState('');
   const [magpieError, setMagpieError] = useState('');
+  const providerUrlRef = useRef<HTMLInputElement | null>(null);
+  const providerModelRef = useRef<HTMLInputElement | null>(null);
+  const providerKeyRef = useRef<HTMLInputElement | null>(null);
+  const magpieInputRef = useRef<HTMLInputElement | null>(null);
 
   // Computers & Domain Access state
   const [allowedDomainsText, setAllowedDomainsText] = useState(state.allowed_domains.join(', '));
@@ -149,6 +155,14 @@ export function SettingsRouter({
   const [desktopWsInput, setDesktopWsInput] = useState(state.desktop_ws_url ?? '');
   const [pairingTokenInput, setPairingTokenInput] = useState('');
   const [computers, setComputers] = useState<Array<Record<string, any>>>([]);
+  const allowedDomainsRef = useRef<HTMLInputElement | null>(null);
+  const blockedDomainsRef = useRef<HTMLInputElement | null>(null);
+  const desktopWsRef = useRef<HTMLInputElement | null>(null);
+  const pairingTokenRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    setLocalPasscodeEnabled(state.passcode_enabled);
+  }, [state.passcode_enabled]);
 
   useEffect(() => {
     setAllowedDomainsText(state.allowed_domains.join(', '));
@@ -218,18 +232,21 @@ export function SettingsRouter({
   const handleEnablePasscode = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorBanner('');
-    if (newPin.trim().length < 4) {
+    const pinVal = (pinInputRef.current?.value ?? newPin).trim();
+    if (pinVal.length < 4) {
       setErrorBanner('Passcode PIN must be at least 4 characters.');
       return;
     }
-    const hash = await hashPasscodeSha256(newPin.trim());
+    const hash = await hashPasscodeSha256(pinVal);
     await sendSwRpc({
       type: 'ui.set_preferences',
       passcode_enabled: true,
       passcode_hash: hash,
       passcode_locked: false,
     });
+    setLocalPasscodeEnabled(true);
     setNewPin('');
+    if (pinInputRef.current) pinInputRef.current.value = '';
     setStatusBanner('✓ Local passcode enabled.');
   };
 
@@ -240,6 +257,7 @@ export function SettingsRouter({
       passcode_hash: '',
       passcode_locked: false,
     });
+    setLocalPasscodeEnabled(false);
     setStatusBanner('Local passcode removed.');
   };
 
@@ -247,8 +265,9 @@ export function SettingsRouter({
     e.preventDefault();
     setMagpieError('');
     setStatusBanner('');
+    const rawUri = magpieInputRef.current?.value ?? magpieUri;
     // Validate strictly BEFORE mutating provider config (T2-F14-04)
-    const parsed = parseMagpieImportUri(magpieUri);
+    const parsed = parseMagpieImportUri(rawUri);
     if (!parsed.ok || !parsed.config) {
       setMagpieError(parsed.error || 'Malformed magpie:// import URI');
       return;
@@ -263,7 +282,7 @@ export function SettingsRouter({
     if (state.authenticated) {
       await apiRequest('/api/v1/hermes/magpie/import', {
         method: 'POST',
-        body: { uri: magpieUri.trim(), config: cfg },
+        body: { uri: rawUri.trim(), config: cfg },
       });
     }
     await chrome.storage.local.set({
@@ -275,26 +294,30 @@ export function SettingsRouter({
       },
     });
     setMagpieUri('');
+    if (magpieInputRef.current) magpieInputRef.current.value = '';
     setStatusBanner('✓ Imported Magpie AI provider configuration.');
   };
 
   const handleSaveAiProvider = async (e: React.FormEvent) => {
     e.preventDefault();
+    const baseVal = (providerUrlRef.current?.value ?? providerBaseUrl).trim();
+    const modelVal = (providerModelRef.current?.value ?? providerModel).trim();
+    const keyVal = (providerKeyRef.current?.value ?? providerApiKey).trim();
     await chrome.storage.local.set({
       ext_bot_config: {
         enabled: true,
-        base_url: providerBaseUrl.trim(),
-        model: providerModel.trim() || 'gpt-4o-mini',
-        api_key: providerApiKey.trim(),
+        base_url: baseVal,
+        model: modelVal || 'gpt-4o-mini',
+        api_key: keyVal,
       },
     });
-    if (state.authenticated && providerBaseUrl.trim()) {
+    if (state.authenticated && baseVal) {
       await apiRequest('/api/v1/hermes/providers', {
         method: 'PUT',
         body: {
-          base_url: providerBaseUrl.trim(),
-          model: providerModel.trim(),
-          api_key: providerApiKey.trim() || undefined,
+          base_url: baseVal,
+          model: modelVal,
+          api_key: keyVal || undefined,
         },
       });
     }
@@ -302,24 +325,28 @@ export function SettingsRouter({
   };
 
   const handleSaveDomainsAndBridge = async () => {
+    const allowedRaw = allowedDomainsRef.current?.value ?? allowedDomainsText;
+    const blockedRaw = blockedDomainsRef.current?.value ?? blockedDomainsText;
+    const wsRaw = (desktopWsRef.current?.value ?? desktopWsInput).trim();
+    const tokenRaw = (pairingTokenRef.current?.value ?? pairingTokenInput).trim();
     await sendSwRpc({
       type: 'ui.set_policy',
       policy: state.run_policy,
-      allowed_domains: allowedDomainsText
+      allowed_domains: allowedRaw
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean),
-      blocked_domains: blockedDomainsText
+      blocked_domains: blockedRaw
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean),
     });
-    if (desktopWsInput.trim() || pairingTokenInput.trim()) {
+    if (wsRaw || tokenRaw) {
       await sendSwRpc({
         type: 'bridge.reconnect',
         bridge_config: {
-          desktop_ws_url: desktopWsInput.trim() || undefined,
-          pairing_token: pairingTokenInput.trim() || undefined,
+          desktop_ws_url: wsRaw || undefined,
+          pairing_token: tokenRaw || undefined,
         },
       });
     }
@@ -414,6 +441,7 @@ export function SettingsRouter({
                     Allowed Domains (comma-separated, empty = allow all http/https)
                   </span>
                   <input
+                    ref={allowedDomainsRef}
                     className="input"
                     data-testid="settings-allowed-domains-input"
                     value={allowedDomainsText}
@@ -424,6 +452,7 @@ export function SettingsRouter({
                 <label className="field-stack">
                   <span className="field-label">Blocked Domains (comma-separated)</span>
                   <input
+                    ref={blockedDomainsRef}
                     className="input"
                     data-testid="settings-blocked-domains-input"
                     value={blockedDomainsText}
@@ -580,6 +609,7 @@ export function SettingsRouter({
                 <label className="field-stack">
                   <span className="field-label">Set Local Passcode PIN (SHA-256)</span>
                   <input
+                    ref={pinInputRef}
                     type="password"
                     className="input"
                     data-testid="passcode-setup-input"
@@ -596,7 +626,7 @@ export function SettingsRouter({
                   >
                     Save Passcode
                   </button>
-                  {state.passcode_enabled && (
+                  {(state.passcode_enabled || localPasscodeEnabled) && (
                     <>
                       <button
                         type="button"
@@ -674,11 +704,13 @@ export function SettingsRouter({
                 const isCurrent = Boolean(s.current || s.is_current);
                 return (
                   <div key={sid} className="studio-list-row" data-testid="session-device-row">
-                    <div className="flex-1">
+                    <span className="flex-1" style={{ display: 'block' }}>
                       <strong>{String(s.device_name ?? s.platform ?? `Session ${sid}`)}</strong>
                       {isCurrent && <span className="badge-pill">Current</span>}
-                      <div className="muted-xs">{String(s.ip ?? sid)}</div>
-                    </div>
+                      <span className="muted-xs" style={{ display: 'block' }}>
+                        {String(s.ip ?? sid)}
+                      </span>
+                    </span>
                     {!isCurrent && (
                       <button
                         type="button"
@@ -710,6 +742,7 @@ export function SettingsRouter({
                 <label className="field-stack">
                   <span className="field-label">Base URL</span>
                   <input
+                    ref={providerUrlRef}
                     className="input"
                     data-testid="provider-base-url-input"
                     value={providerBaseUrl}
@@ -720,6 +753,7 @@ export function SettingsRouter({
                 <label className="field-stack">
                   <span className="field-label">Model</span>
                   <input
+                    ref={providerModelRef}
                     className="input"
                     data-testid="provider-model-input"
                     value={providerModel}
@@ -729,6 +763,7 @@ export function SettingsRouter({
                 <label className="field-stack">
                   <span className="field-label">API Key</span>
                   <input
+                    ref={providerKeyRef}
                     type="password"
                     className="input"
                     data-testid="provider-apikey-input"
@@ -750,6 +785,7 @@ export function SettingsRouter({
                   </div>
                 )}
                 <input
+                  ref={magpieInputRef}
                   className="input mono"
                   data-testid="magpie-import-input"
                   value={magpieUri}
@@ -774,6 +810,7 @@ export function SettingsRouter({
               <label className="field-stack">
                 <span className="field-label">Desktop Loopback WS URL (127.0.0.1)</span>
                 <input
+                  ref={desktopWsRef}
                   className="input mono"
                   data-testid="desktop-ws-url-input"
                   value={desktopWsInput}
@@ -784,6 +821,7 @@ export function SettingsRouter({
               <label className="field-stack">
                 <span className="field-label">Desktop Pairing Token</span>
                 <input
+                  ref={pairingTokenRef}
                   type="password"
                   className="input mono"
                   data-testid="desktop-pairing-token-input"

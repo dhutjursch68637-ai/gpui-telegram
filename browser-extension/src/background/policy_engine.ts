@@ -48,7 +48,12 @@ export class BrowserPolicyEngine {
   private serverPollTimer: ReturnType<typeof setInterval> | null = null;
 
   /** Callback invoked on emergency stop to abort active BrowserController/Bot/Debugger work. */
-  private emergencyStopHooks = new Set<(reason: string) => Promise<void> | void>();
+  private emergencyStopHooks = new Set<
+    (reason: string, meta?: { fromRemoteBridge?: boolean }) => Promise<void> | void
+  >();
+
+  /** Cancels stale in-flight bot browser profile PUT requests so an earlier disabled PUT cannot overwrite a newer re-enable PUT. */
+  private profileSyncAbort: AbortController | null = null;
 
   private readonly broadcast: BroadcastFn;
 
@@ -57,7 +62,9 @@ export class BrowserPolicyEngine {
     this.startServerPendingPoll();
   }
 
-  public onEmergencyStop(fn: (reason: string) => Promise<void> | void): void {
+  public onEmergencyStop(
+    fn: (reason: string, meta?: { fromRemoteBridge?: boolean }) => Promise<void> | void,
+  ): void {
     this.emergencyStopHooks.add(fn);
   }
 
@@ -134,9 +141,13 @@ export class BrowserPolicyEngine {
     await chrome.storage.local.set(nextStorage);
 
     if (options?.syncServerBotProfile !== false && this.serverUrl && this.token) {
+      this.profileSyncAbort?.abort();
+      const ac = new AbortController();
+      this.profileSyncAbort = ac;
       try {
         await fetch(`${this.serverUrl}/api/v1/bots/${OFFICIAL_BOT_USER_ID}/browser`, {
           method: 'PUT',
+          signal: ac.signal,
           headers: {
             Authorization: `Bearer ${this.token}`,
             'Content-Type': 'application/json',
@@ -503,7 +514,14 @@ export class BrowserPolicyEngine {
     });
   }
 
-  public async triggerEmergencyStop(reason = 'Emergency stop triggered'): Promise<void> {
+  public async triggerEmergencyStop(
+    reason = 'Emergency stop triggered',
+    options?: { fromRemoteBridge?: boolean },
+  ): Promise<void> {
+    if (options?.fromRemoteBridge && this.emergencyStopped && this.runPolicy === 'disabled') {
+      return;
+    }
+
     this.emergencyStopped = true;
     this.runPolicy = 'disabled';
     this.sessionApprovedBots.clear();
@@ -522,7 +540,7 @@ export class BrowserPolicyEngine {
     // 2. Immediately abort active BrowserController ops, detach chrome.debugger, and cancel LLM streams
     for (const hook of this.emergencyStopHooks) {
       try {
-        await hook(reason);
+        await hook(reason, options);
       } catch {
         // continue executing all kill-switch hooks
       }
@@ -532,10 +550,14 @@ export class BrowserPolicyEngine {
     await this.setPolicy('disabled', { syncServerBotProfile: false });
     await chrome.storage.local.set({ emergency_stopped: true });
 
-    // 4. Best-effort non-blocking server sync (never blocks local kill-switch latency)
-    if (this.serverUrl && this.token) {
+    // 4. Best-effort non-blocking server sync when initiated locally (never blocks local kill-switch latency)
+    if (!options?.fromRemoteBridge && this.serverUrl && this.token) {
+      this.profileSyncAbort?.abort();
+      const ac = new AbortController();
+      this.profileSyncAbort = ac;
       fetch(`${this.serverUrl}/api/v1/bots/${OFFICIAL_BOT_USER_ID}/browser`, {
         method: 'PUT',
+        signal: ac.signal,
         headers: {
           Authorization: `Bearer ${this.token}`,
           'Content-Type': 'application/json',

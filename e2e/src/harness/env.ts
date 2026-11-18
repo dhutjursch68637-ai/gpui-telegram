@@ -4,11 +4,17 @@ import * as net from 'node:net';
 import * as path from 'node:path';
 import type { ChildProcess } from 'node:child_process';
 
-export const E2E_ROOT = '/home/antigravity/e2e_tests';
-export const E2E_RUNS_ROOT = '/home/antigravity/e2e_tests/.e2e-runs';
+export const E2E_ROOT = process.env.GPUI_E2E_ROOT
+  ? path.resolve(process.env.GPUI_E2E_ROOT)
+  : path.resolve(import.meta.dirname, '..', '..');
+export const E2E_RUNS_ROOT = process.env.GPUI_E2E_RUNS_ROOT
+  ? path.resolve(process.env.GPUI_E2E_RUNS_ROOT)
+  : path.join(E2E_ROOT, '.e2e-runs');
 export const SHM_ROOT = '/dev/shm';
 export const SHM_PREFIX = 'gpui-e2e-';
-export const DEFAULT_SUT_ROOT = '/home/antigravity/gpui-telegram';
+export const DEFAULT_SUT_ROOT = fs.existsSync(path.join(E2E_ROOT, '..', 'Cargo.toml'))
+  ? path.resolve(E2E_ROOT, '..')
+  : '/home/antigravity/gpui-telegram';
 export const CHROMIUM_BIN = '/usr/lib/chromium/chromium';
 export const XVFB_RUN_BIN = '/usr/bin/xvfb-run';
 export const CANONICAL_NO_PROXY = 'localhost,127.0.0.1,::1,[::1]';

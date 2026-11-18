@@ -79,6 +79,7 @@ struct ActiveBridgeSession {
     capabilities: Vec<String>,
     run_policy: BrowserRunPolicy,
     tabs: Vec<BrowserTabDto>,
+    desktop_bridge_connected: bool,
     connected_at_ms: i64,
     last_seen_ms: i64,
     tx: mpsc::UnboundedSender<String>,
@@ -493,7 +494,8 @@ impl BrowserControlService {
         }
 
         let server_relay_connected = ext_sess.is_some();
-        let desktop_bridge_connected = desk_sess.is_some();
+        let desktop_bridge_connected =
+            desk_sess.is_some() || ext_sess.as_ref().is_some_and(|s| s.desktop_bridge_connected);
         let primary = ext_sess.as_ref().or(desk_sess.as_ref());
         let local_cdp_available = global_cdp_manager().resolve_endpoint(None, None).is_some();
 
@@ -568,6 +570,15 @@ impl BrowserControlService {
     }
 
     pub fn trigger_emergency_stop(&self, owner_user_id: u64, reason: Option<String>) {
+        self.trigger_emergency_stop_excluding(owner_user_id, reason, None);
+    }
+
+    fn trigger_emergency_stop_excluding(
+        &self,
+        owner_user_id: u64,
+        reason: Option<String>,
+        exclude_generation: Option<u64>,
+    ) {
         let now_ms = Utc::now().timestamp_millis();
         {
             let mut stopped = self
@@ -605,7 +616,9 @@ impl BrowserControlService {
         };
 
         for sess in user_sessions {
-            if let Some(ref raw) = stop_frame {
+            if exclude_generation != Some(sess.generation)
+                && let Some(ref raw) = stop_frame
+            {
                 let _ = sess.tx.send(raw.clone());
             }
             sess.abort_all_in_flight(
@@ -906,6 +919,7 @@ impl BrowserControlService {
             .unwrap_or(DEFAULT_BROWSER_INVOKE_TIMEOUT_MS)
             .clamp(100, MAX_BROWSER_INVOKE_TIMEOUT_MS);
 
+        let mut pre_approved = false;
         match policy_decision {
             BrowserPolicyDecision::Allow => {}
             BrowserPolicyDecision::Deny { code, reason } => {
@@ -927,7 +941,9 @@ impl BrowserControlService {
                         .unwrap_or_else(|e| e.into_inner())
                         .contains(&session_key);
 
-                if !remembered {
+                if remembered {
+                    pre_approved = true;
+                } else {
                     let now_ms = Utc::now().timestamp_millis();
                     let pending_dto = PendingBrowserCommandDto {
                         command_id: command_id.clone(),
@@ -967,6 +983,7 @@ impl BrowserControlService {
                             remember_for_session,
                         })) => {
                             cleanup_guard.disarmed = true;
+                            pre_approved = true;
                             if remember_for_session && !injection_flagged {
                                 let mut rem = self
                                     .session_remembered
@@ -1012,9 +1029,33 @@ impl BrowserControlService {
             }
         }
 
-        // Fast-path `browser_status` directly from live relay state
+        // Fast-path `browser_status` directly from live relay state (and live Extension status when connected)
         if tool_enum == BrowserToolName::BrowserStatus {
-            let status_dto = self.build_status_for_user(owner_user_id, req.bot_id);
+            let mut status_dto = self.build_status_for_user(owner_user_id, req.bot_id);
+            if let Some(ref sess) = bridge_session {
+                if sess.host_kind == BrowserBridgeHostKind::Server {
+                    let live_probe = self
+                        .invoke_via_ws_session(
+                            sess,
+                            "browser_status",
+                            json!({}),
+                            caller_info.clone(),
+                            2_500,
+                            true,
+                        )
+                        .await;
+                    if live_probe.ok {
+                        if let Some(desk_conn) = live_probe
+                            .data
+                            .get("desktop_bridge_connected")
+                            .and_then(Value::as_bool)
+                        {
+                            status_dto.desktop_bridge_connected =
+                                status_dto.desktop_bridge_connected || desk_conn;
+                        }
+                    }
+                }
+            }
             let mut status_val = serde_json::to_value(&status_dto).unwrap_or_else(|_| json!({}));
             if let Some(obj) = status_val.as_object_mut() {
                 obj.insert(
@@ -1032,8 +1073,15 @@ impl BrowserControlService {
         // Primary execution: connected Extension or Desktop WebSocket bridge
         let arg_cdp_url = req.arguments.get("cdp_url").and_then(Value::as_str);
         let mut cmd_result = if let Some(sess) = bridge_session {
-            self.invoke_via_ws_session(&sess, &canonical_tool, req.arguments.clone(), caller_info, timeout_ms)
-                .await
+            self.invoke_via_ws_session(
+                &sess,
+                &canonical_tool,
+                req.arguments.clone(),
+                caller_info,
+                timeout_ms,
+                pre_approved,
+            )
+            .await
         } else if profile.preferred_target != BrowserPreferredTarget::ExtensionBridge
             && global_cdp_manager().resolve_endpoint(arg_cdp_url, None).is_some()
         {
@@ -1079,6 +1127,7 @@ impl BrowserControlService {
         arguments: Value,
         caller: BrowserCallerInfo,
         timeout_ms: u64,
+        approved: bool,
     ) -> BrowserCommandResult {
         let seq = self.next_rpc_seq.fetch_add(1, Ordering::Relaxed);
         let rpc_id_str = format!("inv_{seq}");
@@ -1089,6 +1138,7 @@ impl BrowserControlService {
                 arguments,
                 caller,
                 timeout_ms,
+                approved,
             },
         );
         let Ok(serialized) = frame.to_json_string() else {
@@ -1454,6 +1504,7 @@ impl ActiveBridgeSession {
             capabilities: self.capabilities.clone(),
             run_policy,
             tabs: self.tabs.clone(),
+            desktop_bridge_connected: self.desktop_bridge_connected,
             connected_at_ms: self.connected_at_ms,
             last_seen_ms: Utc::now().timestamp_millis(),
             tx: self.tx.clone(),
@@ -1690,6 +1741,7 @@ async fn run_browser_ws_session(
         capabilities: Vec::new(),
         run_policy: initial_policy,
         tabs: Vec::new(),
+        desktop_bridge_connected: host_kind == BrowserBridgeHostKind::Desktop,
         connected_at_ms: now_ms,
         last_seen_ms: now_ms,
         tx: tx.clone(),
@@ -1797,6 +1849,8 @@ async fn run_browser_ws_session(
                                         capabilities: params.capabilities.clone(),
                                         run_policy: params.run_policy,
                                         tabs: params.tabs_summary.clone(),
+                                        desktop_bridge_connected: params.desktop_bridge_connected
+                                            || host_kind == BrowserBridgeHostKind::Desktop,
                                         connected_at_ms: curr.connected_at_ms,
                                         last_seen_ms: seen_ms,
                                         tx: curr.tx.clone(),
@@ -1848,6 +1902,8 @@ async fn run_browser_ws_session(
                                         capabilities: curr.capabilities.clone(),
                                         run_policy: params.run_policy,
                                         tabs: params.tabs,
+                                        desktop_bridge_connected: params.desktop_bridge_connected
+                                            || host_kind == BrowserBridgeHostKind::Desktop,
                                         connected_at_ms: curr.connected_at_ms,
                                         last_seen_ms: seen_ms,
                                         tx: curr.tx.clone(),
@@ -1891,7 +1947,11 @@ async fn run_browser_ws_session(
                         }
                     }
                     BrowserBridgeFrame::EmergencyStop { id, params } => {
-                        service.trigger_emergency_stop(owner_user_id, params.reason);
+                        service.trigger_emergency_stop_excluding(
+                            owner_user_id,
+                            params.reason,
+                            Some(generation),
+                        );
                         if let Some(req_id) = id {
                             let ack = BrowserJsonRpcResponse::ok(req_id, json!({ "ok": true }));
                             if let Ok(s) = serde_json::to_string(&ack) {

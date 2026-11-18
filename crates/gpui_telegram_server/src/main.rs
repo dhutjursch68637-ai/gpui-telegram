@@ -3,8 +3,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     ServerConfig::load_dotenv_files();
     if std::env::var("GPUI_OFFLINE_TEST").is_err()

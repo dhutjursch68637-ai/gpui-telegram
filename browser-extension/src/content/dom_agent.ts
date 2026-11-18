@@ -487,12 +487,26 @@
       el.dispatchEvent(new MouseEvent('dblclick', mouseInit));
     }
 
-    await new Promise((r) => setTimeout(r, 30));
+    const anchor = el.closest('a[href]') as HTMLAnchorElement | null;
+    const rawHref = anchor?.getAttribute('href')?.trim() ?? '';
+    const isLinkNav =
+      Boolean(anchor && rawHref) &&
+      !rawHref.startsWith('#') &&
+      !rawHref.toLowerCase().startsWith('javascript:');
+    const isSubmitControl =
+      (el instanceof HTMLButtonElement && el.type === 'submit') ||
+      (el instanceof HTMLInputElement && (el.type === 'submit' || el.type === 'image'));
+    const mightNavigate = buttonCode !== 2 && (isLinkNav || isSubmitControl);
+
+    if (!mightNavigate) {
+      await new Promise((r) => setTimeout(r, 30));
+    }
 
     return {
       ok: true,
       ref: target.ref ?? null,
       tag: el.tagName.toLowerCase(),
+      will_navigate: mightNavigate,
       url_after: window.location.href,
       title_after: document.title || '',
     };
@@ -609,6 +623,7 @@
       );
     }
 
+    let willNavigate = false;
     if (shouldSubmit) {
       const enterInit: KeyboardEventInit = {
         key: 'Enter',
@@ -625,13 +640,15 @@
 
       const form = (el as HTMLInputElement).form ?? el.closest('form');
       if (form) {
+        willNavigate = true;
         if (typeof form.requestSubmit === 'function') {
           form.requestSubmit();
         } else {
           form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
         }
+      } else {
+        await new Promise((r) => setTimeout(r, 25));
       }
-      await new Promise((r) => setTimeout(r, 25));
     }
 
     return {
@@ -639,6 +656,7 @@
       ref: target.ref ?? null,
       value_length: finalValue.length,
       submitted: shouldSubmit,
+      will_navigate: willNavigate,
     };
   }
 
@@ -804,16 +822,30 @@
       }
     }
 
-    const maxScrollY = Math.max(
-      0,
-      (document.documentElement?.scrollHeight || document.body?.scrollHeight || 0) -
-        (window.innerHeight || 0),
+    const vpWidth = Math.round(window.innerWidth || document.documentElement?.clientWidth || 0);
+    const vpHeight = Math.round(window.innerHeight || document.documentElement?.clientHeight || 0);
+    const scrollX = Math.round(window.scrollX || 0);
+    const scrollY = Math.round(window.scrollY || 0);
+    const scrollWidth = Math.round(
+      document.documentElement?.scrollWidth || document.body?.scrollWidth || vpWidth,
     );
+    const scrollHeight = Math.round(
+      document.documentElement?.scrollHeight || document.body?.scrollHeight || vpHeight,
+    );
+    const maxScrollY = Math.max(0, scrollHeight - vpHeight);
     return {
       ok: true,
-      scroll_x: Math.round(window.scrollX || 0),
-      scroll_y: Math.round(window.scrollY || 0),
+      scroll_x: scrollX,
+      scroll_y: scrollY,
       max_scroll_y: Math.round(maxScrollY),
+      viewport: {
+        width: vpWidth,
+        height: vpHeight,
+        scroll_x: scrollX,
+        scroll_y: scrollY,
+        scroll_width: scrollWidth,
+        scroll_height: scrollHeight,
+      },
     };
   }
 

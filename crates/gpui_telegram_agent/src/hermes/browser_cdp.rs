@@ -19,7 +19,9 @@ use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    client_async_with_config, connect_async_with_config, MaybeTlsStream, WebSocketStream,
+};
 
 use super::browser_bridge::{to_browser_injection_dto, validate_navigable_browser_url};
 use super::security::scan_content_for_injection;
@@ -502,6 +504,46 @@ impl CdpBrowserManager {
         cfg.max_message_size = Some(MAX_BROWSER_WS_FRAME_BYTES);
         cfg.max_frame_size = Some(MAX_BROWSER_WS_FRAME_BYTES);
 
+        if ws_url.starts_with("ws://")
+            && let Ok(parsed) = reqwest::Url::parse(ws_url)
+            && let Some(host) = parsed.host_str()
+        {
+            let port = parsed.port_or_known_default().unwrap_or(80);
+            let host_clean = host.trim_start_matches('[').trim_end_matches(']');
+            let addr_str = if host_clean.contains(':') {
+                format!("[{host_clean}]:{port}")
+            } else {
+                format!("{host_clean}:{port}")
+            };
+            let tcp_fut = async {
+                let tcp = TcpStream::connect(&addr_str).await.map_err(|e| {
+                    (
+                        BrowserRpcErrorCode::CdpAttachFailed,
+                        format!("CDP TCP connection failed ({addr_str}): {e}"),
+                    )
+                })?;
+                let _ = tcp.set_nodelay(true);
+                let (ws_stream, _) =
+                    client_async_with_config(ws_url, MaybeTlsStream::Plain(tcp), Some(cfg))
+                        .await
+                        .map_err(|e| {
+                            (
+                                BrowserRpcErrorCode::CdpAttachFailed,
+                                format!("CDP WebSocket handshake failed ({ws_url}): {e}"),
+                            )
+                        })?;
+                Ok::<CdpWsStream, (BrowserRpcErrorCode, String)>(ws_stream)
+            };
+            return tokio::time::timeout(Duration::from_millis(3500), tcp_fut)
+                .await
+                .map_err(|_| {
+                    (
+                        BrowserRpcErrorCode::NavigationTimeout,
+                        format!("Timed out connecting to CDP WebSocket {ws_url}"),
+                    )
+                })?;
+        }
+
         let connect_fut = connect_async_with_config(ws_url, Some(cfg), false);
         let (ws_stream, _) = tokio::time::timeout(Duration::from_millis(3500), connect_fut)
             .await
@@ -819,6 +861,15 @@ impl CdpBrowserManager {
 
     /// Executes any canonical `browser_*` tool directly over Chrome DevTools Protocol.
     pub async fn execute_tool(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        ctx_cdp_url: Option<&str>,
+    ) -> Result<BrowserCommandResult, (BrowserRpcErrorCode, String)> {
+        Box::pin(self.execute_tool_inner(tool_name, args, ctx_cdp_url)).await
+    }
+
+    async fn execute_tool_inner(
         &self,
         tool_name: &str,
         args: &Value,
@@ -1693,7 +1744,14 @@ impl CdpBrowserManager {
                             const dy = dir === 'up' ? -amt : (dir === 'down' ? amt : 0);
                             window.scrollBy(dx, dy);
                         }}
-                        return {{ scroll_x: Math.round(window.scrollX), scroll_y: Math.round(window.scrollY) }};
+                        return {{
+                            scroll_x: Math.round(window.scrollX),
+                            scroll_y: Math.round(window.scrollY),
+                            width: Math.round(window.innerWidth || 0),
+                            height: Math.round(window.innerHeight || 0),
+                            scroll_width: Math.round(document.documentElement?.scrollWidth || 0),
+                            scroll_height: Math.round(document.documentElement?.scrollHeight || 0),
+                        }};
                     }})()"#,
                     serde_json::to_string(direction).unwrap_or_else(|_| "\"down\"".into()),
                     amount,
@@ -1704,11 +1762,25 @@ impl CdpBrowserManager {
                     .eval_js_json(&mut ws, target.tab_id, &js, op_timeout)
                     .await?;
                 let _ = ws.close(None).await;
+                let sx = res.get("scroll_x").and_then(Value::as_i64).unwrap_or(0);
+                let sy = res.get("scroll_y").and_then(Value::as_i64).unwrap_or(0);
+                let vw = res.get("width").and_then(Value::as_i64).unwrap_or(1280);
+                let vh = res.get("height").and_then(Value::as_i64).unwrap_or(800);
+                let sw = res.get("scroll_width").and_then(Value::as_i64).unwrap_or(vw);
+                let sh = res.get("scroll_height").and_then(Value::as_i64).unwrap_or(vh);
                 json!({
                     "ok": true,
                     "tab_id": target.tab_id,
-                    "scroll_x": res.get("scroll_x").and_then(Value::as_i64).unwrap_or(0),
-                    "scroll_y": res.get("scroll_y").and_then(Value::as_i64).unwrap_or(0),
+                    "scroll_x": sx,
+                    "scroll_y": sy,
+                    "viewport": {
+                        "width": vw,
+                        "height": vh,
+                        "scroll_x": sx,
+                        "scroll_y": sy,
+                        "scroll_width": sw,
+                        "scroll_height": sh,
+                    }
                 })
             }
             "browser_wait_for" => {

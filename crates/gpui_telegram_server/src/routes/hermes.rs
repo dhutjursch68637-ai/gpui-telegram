@@ -2821,7 +2821,12 @@ pub async fn hermes_memory_put(
 ) -> Response {
     let bot_id_u64 = q.bot_id.or_else(|| parse_bot_id_u64(payload.get("bot_id")));
     let engine = resolve_hermes_for_bot(&state, bot_id_u64);
-    if let Some(mem_md) = payload.get("memory_markdown").and_then(|v| v.as_str()) {
+    if let Some(mem_md) = payload
+        .get("memory_markdown")
+        .or_else(|| payload.get("content"))
+        .or_else(|| payload.get("memory"))
+        .and_then(|v| v.as_str())
+    {
         if let Err(e) = engine.memory().set_raw(MemoryTarget::Memory, mem_md) {
             return map_telegram_err(e);
         }

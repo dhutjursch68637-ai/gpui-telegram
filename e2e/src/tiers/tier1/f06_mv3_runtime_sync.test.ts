@@ -367,6 +367,7 @@ defineTest({
       {
         timeoutMs: 5000,
         intervalMs: 80,
+        isDone: (v): v is string => v !== null,
         message: 'Cleared unread badge text after markRead',
       },
     );

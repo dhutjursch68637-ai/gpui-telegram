@@ -697,12 +697,23 @@ export class ExtensionSyncEngine {
               ? body.items
               : [];
 
+        const existingBefore = await dbGetMessagesForChat(chatId, 200);
+        const existingPinnedIds = new Set(
+          existingBefore.filter((em) => em.pinned).map((em) => em.message_id),
+        );
         const parsed: StoredMessageDto[] = [];
         let maxPts = await dbGetChatPts(chatId);
         for (const m of rawMsgs) {
           if (m && typeof m === 'object') {
             const norm = normalizeServerMessage(m, chatId);
             if (norm) {
+              if (
+                m.pinned === undefined &&
+                m.is_pinned === undefined &&
+                existingPinnedIds.has(norm.message_id)
+              ) {
+                norm.pinned = true;
+              }
               parsed.push(norm);
               if (norm.pts && norm.pts > maxPts) maxPts = norm.pts;
             }
@@ -788,7 +799,16 @@ export class ExtensionSyncEngine {
     }
 
     // Fallback if server sends flat event frames
-    if (frameType === 'NewMessage' || frameType === 'EditMessage' || frameType === 'ReadHistory' || frameType === 'ReactionUpdated' || frameType === 'MessageReactions') {
+    if (
+      frameType === 'NewMessage' ||
+      frameType === 'EditMessage' ||
+      frameType === 'ReadHistory' ||
+      frameType === 'ReactionUpdated' ||
+      frameType === 'MessageReactions' ||
+      frameType === 'PinnedMessagesChanged' ||
+      frameType === 'PinnedMessageChanged' ||
+      frameType === 'MessagePinned'
+    ) {
       await this.applyUpdateEvent(frame);
     }
   }
@@ -990,6 +1010,47 @@ export class ExtensionSyncEngine {
       return;
     }
 
+    if (
+      evType === 'PinnedMessagesChanged' ||
+      evType === 'PinnedMessageChanged' ||
+      evType === 'MessagePinned'
+    ) {
+      const chatId = unwrapId(data.chat_id) ?? fallbackChatId ?? null;
+      const messageId = unwrapId(data.message_id ?? data.id);
+      const isPinned = data.pinned !== undefined ? Boolean(data.pinned) : !Boolean(data.unpinned);
+      if (chatId !== null) {
+        const current = await dbGetMessagesForChat(chatId, 200);
+        const toUpdate: StoredMessageDto[] = [];
+        const rawPinIds = Array.isArray(data.pinned_message_ids)
+          ? data.pinned_message_ids
+          : Array.isArray(data.pinned_ids)
+            ? data.pinned_ids
+            : null;
+        if (rawPinIds) {
+          const pinSet = new Set(
+            rawPinIds.map(unwrapId).filter((n): n is number => n !== null),
+          );
+          for (const m of current) {
+            const nextPinned = pinSet.has(m.message_id);
+            if (Boolean(m.pinned) !== nextPinned) {
+              toUpdate.push({ ...m, pinned: nextPinned });
+            }
+          }
+        } else if (messageId !== null) {
+          const target = current.find((m) => m.message_id === messageId);
+          if (target) {
+            toUpdate.push({ ...target, pinned: isPinned });
+          }
+        }
+        if (toUpdate.length > 0) {
+          await dbUpsertMessages(toUpdate);
+        }
+        const chatMessages = await dbGetMessagesForChat(chatId, 200);
+        this.broadcast({ type: 'messages_updated', chat_id: chatId, messages: chatMessages });
+      }
+      return;
+    }
+
     if (evType === 'ReadHistory' || evType === 'ReadHistoryIn' || evType === 'ReadHistoryOut') {
       const chatId = unwrapId(data.chat_id) ?? fallbackChatId ?? null;
       if (chatId !== null) {
@@ -1021,11 +1082,9 @@ export class ExtensionSyncEngine {
       return { ok: false, error: 'Empty message text' };
     }
 
+    // Generate a 15-digit safe integer (< Number.MAX_SAFE_INTEGER = 9_007_199_254_740_991)
     const clientNonce =
-      params.clientNonce ||
-      `${Date.now()}${Math.floor(Math.random() * 100000)
-        .toString()
-        .padStart(5, '0')}`;
+      params.clientNonce || String(Date.now() * 100 + Math.floor(Math.random() * 100));
 
     const cfg = this.currentConfig ?? (await readNormalizedStorageConfig());
     const optimisticTempId = -Math.abs(Date.now() % 1_000_000_000);
@@ -1114,7 +1173,18 @@ export class ExtensionSyncEngine {
     if (!cfg.serverUrl || !cfg.token) return null;
 
     try {
-      const numericNonce = Number(item.client_nonce);
+      const parsedNonce = Number(item.client_nonce);
+      let safeNumericNonce: number;
+      if (Number.isSafeInteger(parsedNonce) && parsedNonce > 0) {
+        safeNumericNonce = parsedNonce;
+      } else {
+        let h = 0;
+        const s = String(item.client_nonce || '');
+        for (let i = 0; i < s.length; i++) {
+          h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+        }
+        safeNumericNonce = Math.abs(h) + 1;
+      }
       const resp = await fetch(`${cfg.serverUrl}/api/v1/messages/send`, {
         method: 'POST',
         headers: {
@@ -1127,7 +1197,7 @@ export class ExtensionSyncEngine {
           text: item.text || undefined,
           content: item.content ?? undefined,
           media_id: item.media_id ?? undefined,
-          client_nonce: Number.isSafeInteger(numericNonce) ? numericNonce : item.client_nonce,
+          client_nonce: safeNumericNonce,
           reply_to: item.reply_to_message_id ?? undefined,
           reply_to_message_id: item.reply_to_message_id ?? undefined,
           quote_text: item.quote_text ?? undefined,

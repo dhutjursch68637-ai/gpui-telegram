@@ -1,4 +1,5 @@
 node_modules/
+.e2e-runs/
 .e2e-runs/*
 *.tsbuildinfo
 *.log

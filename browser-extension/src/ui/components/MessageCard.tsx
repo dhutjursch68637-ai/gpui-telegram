@@ -619,18 +619,29 @@ function PollCard({
 
 function GenerativeCardView({ payload }: { payload: Record<string, any> }) {
   const title = String(payload.title ?? payload.heading ?? 'Generative Card');
+  const subtitle = payload.subtitle ?? payload.description ?? payload.summary;
   const blocks: Array<Record<string, any>> = Array.isArray(payload.blocks)
     ? payload.blocks
-    : Array.isArray(payload.items)
-      ? payload.items
-      : [payload];
+    : Array.isArray(payload.components)
+      ? payload.components
+      : Array.isArray(payload.items)
+        ? payload.items
+        : [];
 
   return (
     <div className="generative-card" data-testid="generative-card">
       <div className="gen-card-title">✨ {title}</div>
+      {subtitle && <div className="muted-xs">{String(subtitle)}</div>}
       {blocks.map((blk, idx) => {
+        if (!blk || typeof blk !== 'object') {
+          return (
+            <div key={idx} className="gen-kv-row">
+              <span>{String(blk ?? '')}</span>
+            </div>
+          );
+        }
         const bType = String(blk?.type ?? blk?.kind ?? '').toLowerCase();
-        if (bType === 'progress' || blk?.max !== undefined || blk?.value !== undefined) {
+        if (bType === 'progress' || blk?.max !== undefined || (blk?.value !== undefined && typeof blk.value === 'number' && blk?.max !== undefined)) {
           const rawVal = Number(blk?.value ?? blk?.current ?? 0);
           const rawMax = Number(blk?.max ?? blk?.total ?? 100);
           // Guard max <= 0 & NaN so percentage is strictly finite [0..100] (T2-F13-05)
@@ -654,10 +665,65 @@ function GenerativeCardView({ payload }: { payload: Record<string, any> }) {
             </div>
           );
         }
+        if (bType === 'stat' || bType === 'metric' || bType === 'kv' || blk?.value !== undefined) {
+          return (
+            <div key={idx} className="gen-kv-row" data-testid="generative-stat">
+              {blk?.label && <span className="muted-xs">{String(blk.label)}: </span>}
+              <strong>{String(blk?.value ?? '')}</strong>
+              {blk?.unit && <span className="muted-xs"> {String(blk.unit)}</span>}
+              {blk?.delta && <span className="badge-pill" style={{ marginLeft: 6 }}>{String(blk.delta)}</span>}
+            </div>
+          );
+        }
+        if (bType === 'table' && Array.isArray(blk?.rows)) {
+          const headers = Array.isArray(blk.headers) ? blk.headers : [];
+          return (
+            <table key={idx} className="gen-table" style={{ width: '100%', fontSize: 12 }}>
+              {headers.length > 0 && (
+                <thead>
+                  <tr>
+                    {headers.map((h: any, hi: number) => (
+                      <th key={hi} style={{ textAlign: 'left' }}>{String(h)}</th>
+                    ))}
+                  </tr>
+                </thead>
+              )}
+              <tbody>
+                {blk.rows.map((r: any, ri: number) => (
+                  <tr key={ri}>
+                    {(Array.isArray(r) ? r : Object.values(r ?? {})).map((cell: any, ci: number) => (
+                      <td key={ci}>{String(cell ?? '')}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          );
+        }
+        if (bType === 'list' && Array.isArray(blk?.items)) {
+          return (
+            <ul key={idx} style={{ margin: '4px 0', paddingLeft: 18 }}>
+              {blk.items.map((it: any, li: number) => (
+                <li key={li}>{typeof it === 'object' ? String(it?.label ?? it?.text ?? '') : String(it)}</li>
+              ))}
+            </ul>
+          );
+        }
+        const fallbackLabel = blk?.label ?? blk?.title ?? blk?.name;
+        const fallbackVal =
+          blk?.text ??
+          blk?.summary ??
+          blk?.content ??
+          blk?.description ??
+          blk?.status ??
+          Object.entries(blk)
+            .filter(([k, v]) => k !== 'type' && k !== 'kind' && (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean'))
+            .map(([k, v]) => `${k}: ${String(v)}`)
+            .join(' • ');
         return (
           <div key={idx} className="gen-kv-row">
-            {blk?.label && <span className="muted-xs">{String(blk.label)}: </span>}
-            <span>{String(blk?.text ?? blk?.summary ?? JSON.stringify(blk))}</span>
+            {fallbackLabel && <span className="muted-xs">{String(fallbackLabel)}: </span>}
+            <span>{String(fallbackVal || 'Ready')}</span>
           </div>
         );
       })}
@@ -671,14 +737,20 @@ function normalizeSpecialContent(
   if (msg.poll && typeof msg.poll === 'object') {
     return { kind: 'poll', payload: msg.poll };
   }
-  const c = msg.content;
-  if (!c || typeof c !== 'object') return null;
+  const rawContent = msg.content;
+  if (!rawContent || typeof rawContent !== 'object') return null;
+  const c: Record<string, any> =
+    rawContent.data && typeof rawContent.data === 'object' && !Array.isArray(rawContent.data)
+      ? { ...rawContent, ...rawContent.data }
+      : rawContent;
 
   if (typeof c.type === 'string') {
-    return { kind: c.type.toLowerCase(), payload: c };
+    const k = c.type.toLowerCase().replace(/_/g, '');
+    return { kind: k, payload: c };
   }
   if (typeof c.kind === 'string') {
-    return { kind: c.kind.toLowerCase(), payload: c };
+    const k = c.kind.toLowerCase().replace(/_/g, '');
+    return { kind: k, payload: c };
   }
   // Rust externally tagged enum support: { Voice: {...} }, { Poll: {...} }, { Location: {...} }
   for (const key of [
@@ -700,7 +772,12 @@ function normalizeSpecialContent(
     'Generative',
   ]) {
     if (c[key] && typeof c[key] === 'object') {
-      return { kind: key.toLowerCase(), payload: c[key] };
+      const inner = c[key];
+      const mergedInner =
+        inner.data && typeof inner.data === 'object' && !Array.isArray(inner.data)
+          ? { ...inner, ...inner.data }
+          : inner;
+      return { kind: key.toLowerCase(), payload: mergedInner };
     }
   }
   if (c.waveform || c.waveform_b64 || c.mime_type === 'audio/ogg') {
@@ -712,8 +789,11 @@ function normalizeSpecialContent(
   if (c.latitude !== undefined && c.longitude !== undefined) {
     return { kind: 'location', payload: c };
   }
-  if (c.amount !== undefined && c.currency) {
+  if ((c.amount !== undefined || c.amount_cents !== undefined || c.total_amount !== undefined) && c.currency) {
     return { kind: 'invoice', payload: c };
+  }
+  if (Array.isArray(c.components) || Array.isArray(c.blocks)) {
+    return { kind: 'generativecard', payload: c };
   }
   if (c.media_id || c.file_id) {
     return { kind: 'media', payload: c };
@@ -725,6 +805,8 @@ export function MessageCard({
   msg,
   isMine,
   locale,
+  isLatestThinking = true,
+  isLatestToolSteps = true,
   replyTargetPreview,
   translatedText,
   onReply,
@@ -744,6 +826,8 @@ export function MessageCard({
   msg: StoredMessageDto;
   isMine: boolean;
   locale: ExtensionLocale;
+  isLatestThinking?: boolean;
+  isLatestToolSteps?: boolean;
   replyTargetPreview?: string;
   translatedText?: string;
   onReply: (msg: StoredMessageDto) => void;
@@ -958,7 +1042,11 @@ export function MessageCard({
 
         {/* Collapsible AI Reasoning `<think>` Bubble */}
         {effectiveThinking && (
-          <details className="thinking-box" open data-testid={CANONICAL_TEST_IDS.thinkingBubble}>
+          <details
+            className="thinking-box"
+            open
+            data-testid={isLatestThinking ? CANONICAL_TEST_IDS.thinkingBubble : 'thinking-bubble-history'}
+          >
             <summary className="thinking-summary">💭 {tr(locale, 'stage.thinking')}</summary>
             <div className="thinking-content">{effectiveThinking}</div>
           </details>
@@ -966,7 +1054,10 @@ export function MessageCard({
 
         {/* Expandable Agent & Browser Tool Steps Timeline */}
         {effectiveSteps.length > 0 && (
-          <div className="steps-box" data-testid={CANONICAL_TEST_IDS.toolStepsList}>
+          <div
+            className="steps-box"
+            data-testid={isLatestToolSteps ? CANONICAL_TEST_IDS.toolStepsList : 'tool-steps-history'}
+          >
             <div className="steps-title">
               🔧 {tr(locale, 'stage.toolSteps')} ({effectiveSteps.length})
             </div>
@@ -1069,7 +1160,11 @@ export function MessageCard({
             <div className="muted-xs">{String(special.payload.description ?? '')}</div>
             <div className="invoice-amount">
               {String(special.payload.currency ?? 'XTR')}{' '}
-              {Number(special.payload.amount ?? special.payload.total_amount ?? 0)}
+              {special.payload.amount !== undefined || special.payload.total_amount !== undefined
+                ? Number(special.payload.amount ?? special.payload.total_amount ?? 0)
+                : special.payload.amount_cents !== undefined
+                  ? (Number(special.payload.amount_cents) / 100).toFixed(2)
+                  : 0}
             </div>
           </div>
         )}

@@ -94,19 +94,49 @@ export function CanonicalComposer({
     setSlashNavigatedByArrow(false);
   }, [composerText]);
 
+  const attachInFlightRef = useRef<Promise<AttachedPageContext | null> | null>(null);
+
   const inspectActiveExternalTab = async (): Promise<chrome.tabs.Tab | undefined> => {
     if (typeof chrome === 'undefined' || !chrome.tabs?.query) return undefined;
     const tabs = await chrome.tabs.query({});
     const externalTabs = tabs.filter(
       (t) => t.url && !t.url.startsWith('chrome-extension://'),
     );
-    // Always inspect the genuinely active external tab first so restricted `chrome://` tabs
-    // are never silently bypassed in favor of an inactive background tab (T2-F13-06).
-    return (
-      externalTabs.find((t) => t.active) ??
-      externalTabs.find((t) => !isRestrictedTabUrl(t.url)) ??
-      externalTabs[0]
+    // 1. If a non-extension tab is currently active (e.g. sidepanel open over a restricted `chrome://`
+    //    or `http://` tab), always inspect it first so restricted `chrome://` tabs are never bypassed (T2-F13-06).
+    const activeExternal = externalTabs.find((t) => t.active);
+    if (activeExternal) {
+      return activeExternal;
+    }
+    // 2. Otherwise an extension surface (`workspace.html` / `popup.html`) is the active tab.
+    //    Prefer the most recently accessed / highest-index controllable HTTP(S) tab over Tab 0 `about:blank`,
+    //    unless a restricted `chrome://` tab was opened more recently than any HTTP(S) tab.
+    const controllableHttp = externalTabs.filter(
+      (t) => !isRestrictedTabUrl(t.url) && /^https?:/i.test(t.url || ''),
     );
+    const restrictedExplicit = externalTabs.filter(
+      (t) => t.url && /^(?:chrome|edge|brave|devtools|view-source):/i.test(t.url),
+    );
+    if (controllableHttp.length > 0 && restrictedExplicit.length > 0) {
+      const bestHttp = [...controllableHttp].sort(
+        (a, b) => ((b as any).lastAccessed ?? b.id ?? 0) - ((a as any).lastAccessed ?? a.id ?? 0),
+      )[0]!;
+      const bestRestricted = [...restrictedExplicit].sort(
+        (a, b) => ((b as any).lastAccessed ?? b.id ?? 0) - ((a as any).lastAccessed ?? a.id ?? 0),
+      )[0]!;
+      const httpTs = (bestHttp as any).lastAccessed ?? bestHttp.id ?? 0;
+      const restTs = (bestRestricted as any).lastAccessed ?? bestRestricted.id ?? 0;
+      return restTs > httpTs ? bestRestricted : bestHttp;
+    }
+    if (controllableHttp.length > 0) {
+      return [...controllableHttp].sort(
+        (a, b) => ((b as any).lastAccessed ?? b.id ?? 0) - ((a as any).lastAccessed ?? a.id ?? 0),
+      )[0];
+    }
+    if (restrictedExplicit.length > 0) {
+      return restrictedExplicit[restrictedExplicit.length - 1];
+    }
+    return externalTabs.find((t) => !isRestrictedTabUrl(t.url)) ?? externalTabs[0];
   };
 
   useEffect(() => {
@@ -173,23 +203,31 @@ export function CanonicalComposer({
   const handleAttachActivePage = async () => {
     setWarningMsg('');
     setAttachingPage(true);
+    const task = fetchActivePageContext();
+    attachInFlightRef.current = task;
     try {
-      const ctx = await fetchActivePageContext();
+      const ctx = await task;
       if (ctx) {
         setAttachedPage(ctx);
       }
     } catch (err: any) {
       setWarningMsg(String(err?.message ?? tr(locale, 'composer.restrictedTab')));
     } finally {
+      if (attachInFlightRef.current === task) {
+        attachInFlightRef.current = null;
+      }
       setAttachingPage(false);
     }
   };
 
   const triggerSend = async () => {
-    const raw = composerText.trim();
-    if (!raw && !attachedPage) return;
-
     let pageCtx = attachedPage;
+    if (!pageCtx && attachInFlightRef.current) {
+      pageCtx = await attachInFlightRef.current.catch(() => null);
+    }
+    const raw = (textareaRef.current?.value ?? composerText).trim();
+    if (!raw && !pageCtx) return;
+
     if (!pageCtx && /(?:^|\s)@page\b/i.test(raw)) {
       const resolved = await fetchActivePageContext().catch(() => null);
       if (resolved) {
@@ -207,6 +245,7 @@ export function CanonicalComposer({
     }
 
     onComposerTextChange('');
+    if (textareaRef.current) textareaRef.current.value = '';
     setAttachedPage(null);
     setWarningMsg('');
     await onSendMessage({ text: finalBody });

@@ -39,6 +39,7 @@ pub struct PublishPreKeysResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DevicePreKeyBundle {
+    #[serde(default)]
     pub user_id: u64,
     pub device_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

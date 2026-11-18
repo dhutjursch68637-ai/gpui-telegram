@@ -35,6 +35,7 @@ use gpui_telegram_proto::e2ee::{
 use gpui_telegram_proto::ws::{WsClientFrame, WsServerFrame};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr;
@@ -83,6 +84,7 @@ struct WasmCoreState {
     pts: WasmPtsCoordinator,
     e2ee_sessions: HashMap<String, WasmDoubleRatchetSession>,
     sender_key_sessions: HashMap<String, WasmSenderKeyState>,
+    keygen_counter: u64,
     #[cfg(not(target_pointer_width = "32"))]
     native_invoke_ptrs: HashMap<u32, usize>,
     #[cfg(not(target_pointer_width = "32"))]
@@ -94,6 +96,7 @@ impl WasmCoreState {
         self.pts.clear();
         self.e2ee_sessions.clear();
         self.sender_key_sessions.clear();
+        self.keygen_counter = 0;
         #[cfg(not(target_pointer_width = "32"))]
         {
             self.native_invoke_ptrs.clear();
@@ -104,6 +107,28 @@ impl WasmCoreState {
 
 thread_local! {
     static STATE: RefCell<WasmCoreState> = RefCell::new(WasmCoreState::default());
+}
+
+fn next_keygen_nonce() -> u64 {
+    STATE.with(|cell| {
+        let mut st = cell.borrow_mut();
+        st.keygen_counter = st.keygen_counter.wrapping_add(1);
+        st.keygen_counter
+    })
+}
+
+fn derive_subseed_32(entropy: &[u8], domain: &str, index: u64) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"gpui-wasm-subseed-v1:");
+    hasher.update(domain.as_bytes());
+    hasher.update(b":");
+    hasher.update(index.to_le_bytes());
+    hasher.update(b":");
+    hasher.update(entropy);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -524,6 +549,10 @@ fn op_pts_get_set(req: &Value) -> Result<Value, (&'static str, String)> {
 fn op_pts_eval(req: &Value) -> Result<Value, (&'static str, String)> {
     let upd_val = req.get("update").unwrap_or(req);
     let update = parse_pts_update_flexible(upd_val).map_err(|e| ("INVALID_PARAMS", e))?;
+    let seed_pts = req
+        .get("local_pts")
+        .or_else(|| req.get("current_pts"))
+        .and_then(|v| v.as_u64());
     let auto_buffer = req
         .get("auto_buffer_gap")
         .and_then(|v| v.as_bool())
@@ -531,6 +560,12 @@ fn op_pts_eval(req: &Value) -> Result<Value, (&'static str, String)> {
 
     STATE.with(|cell| {
         let mut st = cell.borrow_mut();
+        if let Some(s) = seed_pts
+            && s > 0
+            && st.pts.last_pts(update.chat_id) == 0
+        {
+            st.pts.set_pts(update.chat_id, s);
+        }
         let outcome = st.pts.evaluate_update(&update);
         let mut buffered_count = st.pts.buffered_count(update.chat_id);
         if auto_buffer && matches!(outcome, PtsEvalOutcomeDto::GapDetected { .. }) {
@@ -548,11 +583,21 @@ fn op_pts_eval(req: &Value) -> Result<Value, (&'static str, String)> {
 fn op_pts_buffer_gap(req: &Value) -> Result<Value, (&'static str, String)> {
     let upd_val = req.get("update").unwrap_or(req);
     let update = parse_pts_update_flexible(upd_val).map_err(|e| ("INVALID_PARAMS", e))?;
+    let seed_pts = req
+        .get("local_pts")
+        .or_else(|| req.get("current_pts"))
+        .and_then(|v| v.as_u64());
     let chat_id_raw = update.chat_id.0;
     let buffered_pts = update.pts;
 
     STATE.with(|cell| {
         let mut st = cell.borrow_mut();
+        if let Some(s) = seed_pts
+            && s > 0
+            && st.pts.last_pts(update.chat_id) == 0
+        {
+            st.pts.set_pts(update.chat_id, s);
+        }
         let count = st.pts.buffer_gap_update(update);
         Ok(json!({
             "chat_id": chat_id_raw,
@@ -568,12 +613,21 @@ fn op_pts_drain_buffer(req: &Value) -> Result<Value, (&'static str, String)> {
         .and_then(|v| v.as_i64())
         .ok_or_else(|| ("INVALID_PARAMS", "missing integer 'chat_id'".into()))?;
     let set_pts = req.get("set_pts").and_then(|v| v.as_u64());
+    let seed_pts = req
+        .get("local_pts")
+        .or_else(|| req.get("current_pts"))
+        .and_then(|v| v.as_u64());
     let chat_id = ChatId(chat_id_raw);
 
     STATE.with(|cell| {
         let mut st = cell.borrow_mut();
         if let Some(reconciled_pts) = set_pts {
             st.pts.set_pts(chat_id, reconciled_pts);
+        } else if let Some(s) = seed_pts
+            && s > 0
+            && st.pts.last_pts(chat_id) == 0
+        {
+            st.pts.set_pts(chat_id, s);
         }
         let drained = st.pts.drain_contiguous_buffer(chat_id);
         let current_pts = st.pts.last_pts(chat_id);
@@ -583,6 +637,7 @@ fn op_pts_drain_buffer(req: &Value) -> Result<Value, (&'static str, String)> {
             "current_pts": current_pts,
             "drained_count": drained.len(),
             "drained": drained,
+            "updates": drained,
             "remaining_buffered": remaining,
         }))
     })
@@ -600,43 +655,60 @@ fn op_e2ee_generate_bundle(req: &Value) -> Result<Value, (&'static str, String)>
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    let ik_x_b64 = req
+    let explicit_seed = req
+        .get("seed")
+        .or_else(|| req.get("seed_b64"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    let base_entropy: Vec<u8> = if let Some(s) = explicit_seed {
+        b64_decode_vec(s).unwrap_or_else(|_| s.as_bytes().to_vec())
+    } else {
+        let nonce = next_keygen_nonce();
+        let mut buf = Vec::with_capacity(device_id.len() + 24);
+        buf.extend_from_slice(device_id.as_bytes());
+        buf.extend_from_slice(&user_id.to_le_bytes());
+        buf.extend_from_slice(&nonce.to_le_bytes());
+        buf
+    };
+
+    let ik_x: [u8; 32] = if let Some(ik_x_b64) = req
         .get("identity_x25519_seed_b64")
         .or_else(|| req.get("x25519_seed_b64"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ("INVALID_PARAMS", "missing 'identity_x25519_seed_b64'".into()))?;
-    let ik_ed_b64 = req
+    {
+        b64_decode_32(ik_x_b64).map_err(|e| ("INVALID_KEY", e))?
+    } else {
+        derive_subseed_32(&base_entropy, "identity_x25519", 0)
+    };
+
+    let ik_ed: [u8; 32] = if let Some(ik_ed_b64) = req
         .get("identity_ed25519_seed_b64")
         .or_else(|| req.get("ed25519_seed_b64"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| ("INVALID_PARAMS", "missing 'identity_ed25519_seed_b64'".into()))?;
-
-    let ik_x = b64_decode_32(ik_x_b64).map_err(|e| ("INVALID_KEY", e))?;
-    let ik_ed = b64_decode_32(ik_ed_b64).map_err(|e| ("INVALID_KEY", e))?;
-
-    // If signed_prekey_seed_b64 is omitted (e.g. lightweight `e2ee_generate_identity` call),
-    // return the X25519 + Ed25519 identity pair directly; otherwise generate full prekey bundle.
-    let Some(spk_seed_b64) = req.get("signed_prekey_seed_b64").and_then(|v| v.as_str()) else {
-        let ik_x_pub = x25519_pub_from_secret(&ik_x);
-        let ik_ed_pub = SigningKey::from_bytes(&ik_ed).verifying_key().to_bytes();
-        let spk_sig_self = sign_signed_prekey(&ik_ed, &ik_x_pub);
-        return Ok(json!({
-            "device_id": device_id,
-            "identity_x25519_sec_b64": b64_encode(&ik_x),
-            "identity_x25519_pub_b64": b64_encode(&ik_x_pub),
-            "identity_ed25519_sec_b64": b64_encode(&ik_ed),
-            "identity_ed25519_pub_b64": b64_encode(&ik_ed_pub),
-            "identity_self_signature_b64": b64_encode(&spk_sig_self),
-        }));
+    {
+        b64_decode_32(ik_ed_b64).map_err(|e| ("INVALID_KEY", e))?
+    } else {
+        derive_subseed_32(&base_entropy, "identity_ed25519", 0)
     };
 
-    let spk_seed = b64_decode_32(spk_seed_b64).map_err(|e| ("INVALID_KEY", e))?;
     let spk_id_u64 = req
         .get("signed_prekey_id")
+        .or_else(|| req.get("spk_id"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1);
     let spk_id = u32::try_from(spk_id_u64)
         .map_err(|_| ("INVALID_PARAMS", "signed_prekey_id overflows u32".into()))?;
+    let spk_seed: [u8; 32] = if let Some(spk_seed_b64) = req
+        .get("signed_prekey_seed_b64")
+        .or_else(|| req.get("spk_seed_b64"))
+        .and_then(|v| v.as_str())
+    {
+        b64_decode_32(spk_seed_b64).map_err(|e| ("INVALID_KEY", e))?
+    } else {
+        derive_subseed_32(&base_entropy, "signed_prekey", u64::from(spk_id))
+    };
+
     let created_at_ms = req
         .get("created_at_ms")
         .and_then(|v| v.as_i64())
@@ -645,12 +717,32 @@ fn op_e2ee_generate_bundle(req: &Value) -> Result<Value, (&'static str, String)>
     let otpk_seeds: Vec<OneTimeSeedInput> = match req.get("one_time_prekeys") {
         Some(v) if !v.is_null() => serde_json::from_value(v.clone())
             .map_err(|e| ("INVALID_PARAMS", format!("invalid 'one_time_prekeys': {e}")))?,
-        _ => Vec::new(),
+        _ => {
+            let count = req
+                .get("otpk_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .min(256) as usize;
+            (0..count)
+                .map(|idx| OneTimeSeedInput {
+                    key_id: 100 + idx as u32,
+                    seed_b64: b64_encode(&derive_subseed_32(
+                        &base_entropy,
+                        "one_time_prekey",
+                        idx as u64,
+                    )),
+                })
+                .collect()
+        }
     };
+
+    let ik_x_pub = x25519_pub_from_secret(&ik_x);
+    let ik_ed_pub = SigningKey::from_bytes(&ik_ed).verifying_key().to_bytes();
+    let spk_sig_self = sign_signed_prekey(&ik_ed, &ik_x_pub);
 
     let out = generate_device_bundle_from_seeds(
         user_id,
-        device_id,
+        device_id.clone(),
         device_name,
         ik_x,
         ik_ed,
@@ -661,18 +753,77 @@ fn op_e2ee_generate_bundle(req: &Value) -> Result<Value, (&'static str, String)>
     )
     .map_err(|e| ("E2EE_KEYGEN_FAILED", e))?;
 
-    serde_json::to_value(out).map_err(|e| ("SERIALIZE_ERROR", e.to_string()))
+    let mut otpk_secrets_map = Map::new();
+    let otpk_items: Vec<Value> = out
+        .one_time_secrets
+        .iter()
+        .map(|o| {
+            otpk_secrets_map.insert(o.key_id.to_string(), json!(o.secret_b64));
+            json!({
+                "key_id": o.key_id,
+                "public_key": o.public_b64,
+                "secret_key": o.secret_b64,
+            })
+        })
+        .collect();
+
+    let mut val = serde_json::to_value(&out).map_err(|e| ("SERIALIZE_ERROR", e.to_string()))?;
+    if let Some(map) = val.as_object_mut() {
+        map.insert("device_id".into(), json!(device_id));
+        map.insert(
+            "identity_self_signature_b64".into(),
+            json!(b64_encode(&spk_sig_self)),
+        );
+        map.insert("ed25519_pub".into(), json!(b64_encode(&ik_ed_pub)));
+        map.insert("identity_key".into(), json!(out.identity_x25519_pub_b64));
+        map.insert("identity_secret".into(), json!(out.identity_x25519_sec_b64));
+        map.insert(
+            "identity_signing_key".into(),
+            json!(out.identity_ed25519_pub_b64),
+        );
+        map.insert(
+            "identity_signing_secret".into(),
+            json!(out.identity_ed25519_sec_b64),
+        );
+        map.insert(
+            "signed_prekey".into(),
+            json!({
+                "key_id": out.public_bundle.signed_prekey.key_id,
+                "public_key": out.public_bundle.signed_prekey.public_key,
+                "signature": out.public_bundle.signed_prekey.signature,
+                "created_at_ms": out.public_bundle.signed_prekey.created_at_ms,
+                "secret_key": out.signed_prekey_sec_b64,
+            }),
+        );
+        map.insert(
+            "signed_prekey_secret".into(),
+            json!(out.signed_prekey_sec_b64),
+        );
+        map.insert("one_time_prekeys".into(), json!(otpk_items));
+        map.insert(
+            "one_time_prekey_secrets".into(),
+            Value::Object(otpk_secrets_map),
+        );
+        map.insert("bundle".into(), json!(out.public_bundle));
+    }
+    Ok(val)
 }
 
 fn op_e2ee_safety_emojis(req: &Value) -> Result<Value, (&'static str, String)> {
     let local_b64 = req
         .get("local_identity_key_b64")
         .or_else(|| req.get("local_ik_b64"))
+        .or_else(|| req.get("local_ik"))
+        .or_else(|| req.get("local_identity_key"))
+        .or_else(|| req.get("ik_a"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| ("INVALID_PARAMS", "missing 'local_identity_key_b64'".into()))?;
     let remote_b64 = req
         .get("remote_identity_key_b64")
         .or_else(|| req.get("remote_ik_b64"))
+        .or_else(|| req.get("remote_ik"))
+        .or_else(|| req.get("remote_identity_key"))
+        .or_else(|| req.get("ik_b"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| ("INVALID_PARAMS", "missing 'remote_identity_key_b64'".into()))?;
 
@@ -693,19 +844,28 @@ fn op_e2ee_x3dh_role(role: &str, req: &Value) -> Result<Value, (&'static str, St
         "initiator" | "alice" => {
             let ik_a_sec = b64_decode_32(
                 req.get("ik_a_sec_b64")
+                    .or_else(|| req.get("ik_a_sec"))
+                    .or_else(|| req.get("identity_secret"))
+                    .or_else(|| req.get("alice_identity_secret"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ("INVALID_PARAMS", "missing 'ik_a_sec_b64'".into()))?,
             )
             .map_err(|e| ("INVALID_KEY", e))?;
-            let ek_a_sec = b64_decode_32(
-                req.get("ek_a_sec_b64")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ("INVALID_PARAMS", "missing 'ek_a_sec_b64'".into()))?,
-            )
-            .map_err(|e| ("INVALID_KEY", e))?;
+            let ek_a_sec: [u8; 32] = if let Some(ek_str) = req
+                .get("ek_a_sec_b64")
+                .or_else(|| req.get("ek_a_sec"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                b64_decode_32(ek_str).map_err(|e| ("INVALID_KEY", e))?
+            } else {
+                let nonce = next_keygen_nonce();
+                derive_subseed_32(&ik_a_sec, "x3dh_ephemeral", nonce)
+            };
             let bundle_val = req
                 .get("remote_bundle")
                 .or_else(|| req.get("bundle"))
+                .or_else(|| req.get("peer_bundle"))
                 .ok_or_else(|| ("INVALID_PARAMS", "missing 'remote_bundle'".into()))?;
             let bundle: DevicePreKeyBundle = serde_json::from_value(bundle_val.clone())
                 .map_err(|e| ("INVALID_PARAMS", format!("invalid 'remote_bundle': {e}")))?;
@@ -717,10 +877,12 @@ fn op_e2ee_x3dh_role(role: &str, req: &Value) -> Result<Value, (&'static str, St
             let safety_emojis = compute_safety_number_emojis(&ik_a_pub, &x3dh.remote_ik_pub);
             let otpk_id = bundle.one_time_prekey.as_ref().map(|o| o.key_id);
 
-            // If `ratchet_dh_sec_b64` is supplied, also initialize Alice's DoubleRatchetSession immediately;
-            // otherwise return `shared_secret_b64` + `associated_data_b64` for a follow-up `e2ee_ratchet_init`.
             let mut session_json: Option<String> = None;
-            if let Some(ratchet_b64) = req.get("ratchet_dh_sec_b64").and_then(|v| v.as_str()) {
+            if let Some(ratchet_b64) = req
+                .get("ratchet_dh_sec_b64")
+                .or_else(|| req.get("ratchet_dh_sec"))
+                .and_then(|v| v.as_str())
+            {
                 let ratchet_dh_sec =
                     b64_decode_32(ratchet_b64).map_err(|e| ("INVALID_KEY", e))?;
                 let mut session = WasmDoubleRatchetSession::init_alice(
@@ -744,15 +906,24 @@ fn op_e2ee_x3dh_role(role: &str, req: &Value) -> Result<Value, (&'static str, St
                 session_json = Some(encoded);
             }
 
+            let shared_b64 = b64_encode(&*x3dh.shared_secret);
+            let ad_b64 = b64_encode(&x3dh.associated_data);
+            let ek_pub_b64 = b64_encode(&ek_a_pub);
+
             Ok(json!({
                 "role": "initiator",
                 "session_id": session_id,
                 "session_json": session_json,
-                "shared_secret_b64": b64_encode(&*x3dh.shared_secret),
-                "associated_data_b64": b64_encode(&x3dh.associated_data),
+                "session": session_json,
+                "shared_secret_b64": shared_b64,
+                "shared_secret": shared_b64,
+                "associated_data_b64": ad_b64,
+                "associated_data": ad_b64,
                 "remote_spk_pub_b64": b64_encode(&x3dh.remote_spk_pub),
                 "identity_pub_b64": b64_encode(&ik_a_pub),
-                "ephemeral_pub_b64": b64_encode(&ek_a_pub),
+                "ephemeral_pub_b64": ek_pub_b64,
+                "ephemeral_pub": ek_pub_b64,
+                "ek_a_pub": ek_pub_b64,
                 "used_signed_prekey_id": bundle.signed_prekey.key_id,
                 "used_one_time_prekey_id": otpk_id,
                 "safety_emojis": safety_emojis,
@@ -762,17 +933,28 @@ fn op_e2ee_x3dh_role(role: &str, req: &Value) -> Result<Value, (&'static str, St
         "responder" | "bob" => {
             let ik_b_sec = b64_decode_32(
                 req.get("ik_b_sec_b64")
+                    .or_else(|| req.get("ik_b_sec"))
+                    .or_else(|| req.get("identity_secret"))
+                    .or_else(|| req.get("bob_identity_secret"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ("INVALID_PARAMS", "missing 'ik_b_sec_b64'".into()))?,
             )
             .map_err(|e| ("INVALID_KEY", e))?;
             let spk_b_sec = b64_decode_32(
                 req.get("spk_b_sec_b64")
+                    .or_else(|| req.get("spk_b_sec"))
+                    .or_else(|| req.get("signed_prekey_secret"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ("INVALID_PARAMS", "missing 'spk_b_sec_b64'".into()))?,
             )
             .map_err(|e| ("INVALID_KEY", e))?;
-            let opk_b_sec = match req.get("opk_b_sec_b64").and_then(|v| v.as_str()) {
+            let opk_b_sec = match req
+                .get("opk_b_sec_b64")
+                .or_else(|| req.get("opk_b_sec"))
+                .or_else(|| req.get("otpk_b_sec"))
+                .or_else(|| req.get("one_time_prekey_secret"))
+                .and_then(|v| v.as_str())
+            {
                 Some(s) if !s.is_empty() => {
                     Some(b64_decode_32(s).map_err(|e| ("INVALID_KEY", e))?)
                 }
@@ -780,12 +962,18 @@ fn op_e2ee_x3dh_role(role: &str, req: &Value) -> Result<Value, (&'static str, St
             };
             let ik_a_pub = b64_decode_32(
                 req.get("ik_a_pub_b64")
+                    .or_else(|| req.get("ik_a_pub"))
+                    .or_else(|| req.get("peer_identity_key"))
+                    .or_else(|| req.get("alice_identity_key"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ("INVALID_PARAMS", "missing 'ik_a_pub_b64'".into()))?,
             )
             .map_err(|e| ("INVALID_KEY", e))?;
             let ek_a_pub = b64_decode_32(
                 req.get("ek_a_pub_b64")
+                    .or_else(|| req.get("ek_a_pub"))
+                    .or_else(|| req.get("ephemeral_pub"))
+                    .or_else(|| req.get("ephemeral_public_key"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ("INVALID_PARAMS", "missing 'ek_a_pub_b64'".into()))?,
             )
@@ -811,12 +999,18 @@ fn op_e2ee_x3dh_role(role: &str, req: &Value) -> Result<Value, (&'static str, St
                 });
             }
 
+            let shared_b64 = b64_encode(&*shared_secret);
+            let ad_b64 = b64_encode(&ad);
+
             Ok(json!({
                 "role": "responder",
                 "session_id": session_id,
                 "session_json": session_json,
-                "shared_secret_b64": b64_encode(&*shared_secret),
-                "associated_data_b64": b64_encode(&ad),
+                "session": session_json,
+                "shared_secret_b64": shared_b64,
+                "shared_secret": shared_b64,
+                "associated_data_b64": ad_b64,
+                "associated_data": ad_b64,
                 "safety_emojis": safety_emojis,
             }))
         }
@@ -832,18 +1026,30 @@ fn op_e2ee_ratchet_init(req: &Value) -> Result<Value, (&'static str, String)> {
     let role = req
         .get("role")
         .and_then(|v| v.as_str())
-        .unwrap_or("alice");
+        .unwrap_or_else(|| {
+            if req.get("is_initiator").and_then(|v| v.as_bool()) == Some(false) {
+                "bob"
+            } else {
+                "alice"
+            }
+        });
     let session_id = req
         .get("session_id")
         .and_then(|v| v.as_str())
         .map(String::from);
     let shared_secret = b64_decode_32(
         req.get("shared_secret_b64")
+            .or_else(|| req.get("shared_secret"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| ("INVALID_PARAMS", "missing 'shared_secret_b64'".into()))?,
     )
     .map_err(|e| ("INVALID_KEY", e))?;
-    let ad = match req.get("associated_data_b64").or_else(|| req.get("ad_b64")).and_then(|v| v.as_str()) {
+    let ad = match req
+        .get("associated_data_b64")
+        .or_else(|| req.get("ad_b64"))
+        .or_else(|| req.get("associated_data"))
+        .and_then(|v| v.as_str())
+    {
         Some(s) if !s.is_empty() => b64_decode_vec(s).map_err(|e| ("INVALID_PARAMS", e))?,
         _ => Vec::new(),
     };
@@ -853,17 +1059,25 @@ fn op_e2ee_ratchet_init(req: &Value) -> Result<Value, (&'static str, String)> {
             let remote_dh_pub = b64_decode_32(
                 req.get("remote_dh_pub_b64")
                     .or_else(|| req.get("bob_dh_pub_b64"))
+                    .or_else(|| req.get("remote_dh_pub"))
+                    .or_else(|| req.get("bob_dh_pub"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ("INVALID_PARAMS", "missing 'remote_dh_pub_b64'".into()))?,
             )
             .map_err(|e| ("INVALID_KEY", e))?;
-            let dh_self_sec = b64_decode_32(
-                req.get("self_dh_sec_b64")
-                    .or_else(|| req.get("ratchet_dh_sec_b64"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ("INVALID_PARAMS", "missing 'self_dh_sec_b64'".into()))?,
-            )
-            .map_err(|e| ("INVALID_KEY", e))?;
+            let dh_self_sec: [u8; 32] = if let Some(s) = req
+                .get("self_dh_sec_b64")
+                .or_else(|| req.get("ratchet_dh_sec_b64"))
+                .or_else(|| req.get("self_dh_sec"))
+                .or_else(|| req.get("ratchet_dh_sec"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                b64_decode_32(s).map_err(|e| ("INVALID_KEY", e))?
+            } else {
+                let nonce = next_keygen_nonce();
+                derive_subseed_32(&shared_secret, "ratchet_alice_dh", nonce)
+            };
             WasmDoubleRatchetSession::init_alice(shared_secret, remote_dh_pub, dh_self_sec, ad)
                 .map_err(|e| ("RATCHET_INIT_FAILED", e))?
         }
@@ -871,6 +1085,8 @@ fn op_e2ee_ratchet_init(req: &Value) -> Result<Value, (&'static str, String)> {
             let bob_dh_sec = b64_decode_32(
                 req.get("self_dh_sec_b64")
                     .or_else(|| req.get("bob_dh_sec_b64"))
+                    .or_else(|| req.get("self_dh_sec"))
+                    .or_else(|| req.get("bob_dh_sec"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| ("INVALID_PARAMS", "missing 'self_dh_sec_b64'".into()))?,
             )
@@ -896,6 +1112,8 @@ fn op_e2ee_ratchet_init(req: &Value) -> Result<Value, (&'static str, String)> {
         "role": role,
         "session_id": session_id,
         "session_json": session_json,
+        "session": session_json,
+        "state": session_json,
     }))
 }
 
@@ -907,10 +1125,32 @@ fn load_ratchet_session(
         .and_then(|v| v.as_str())
         .map(String::from);
 
-    if let Some(raw_json) = req.get("session_json").and_then(|v| v.as_str()) {
-        let sess =
-            WasmDoubleRatchetSession::from_json(raw_json).map_err(|e| ("INVALID_SESSION", e))?;
-        return Ok((session_id, sess));
+    if let Some(sess_val) = req
+        .get("session_json")
+        .or_else(|| req.get("session"))
+        .or_else(|| req.get("state"))
+    {
+        if let Some(raw_json) = sess_val.as_str() {
+            let sess = WasmDoubleRatchetSession::from_json(raw_json)
+                .map_err(|e| ("INVALID_SESSION", e))?;
+            return Ok((session_id, sess));
+        }
+        if sess_val.is_object() {
+            if let Some(nested_str) = sess_val
+                .get("session_json")
+                .or_else(|| sess_val.get("session"))
+                .and_then(|v| v.as_str())
+            {
+                let sess = WasmDoubleRatchetSession::from_json(nested_str)
+                    .map_err(|e| ("INVALID_SESSION", e))?;
+                return Ok((session_id, sess));
+            }
+            let raw_json =
+                serde_json::to_string(sess_val).map_err(|e| ("INVALID_SESSION", e.to_string()))?;
+            let sess = WasmDoubleRatchetSession::from_json(&raw_json)
+                .map_err(|e| ("INVALID_SESSION", e))?;
+            return Ok((session_id, sess));
+        }
     }
 
     if let Some(ref sid) = session_id {
@@ -965,10 +1205,13 @@ fn op_e2ee_ratchet_encrypt(req: &Value) -> Result<Value, (&'static str, String)>
         "session_id": session_id,
         "header": header,
         "ciphertext_b64": ciphertext_b64,
+        "ciphertext": ciphertext_b64,
         "ephemeral_key_b64": ek_b64,
         "used_signed_prekey_id": spk_id,
         "used_one_time_prekey_id": otpk_id,
         "session_json": session_json,
+        "session": session_json,
+        "state": session_json,
     }))
 }
 
@@ -976,19 +1219,30 @@ fn op_e2ee_ratchet_decrypt(req: &Value) -> Result<Value, (&'static str, String)>
     let (session_id, mut session) = load_ratchet_session(req)?;
     let header_val = req
         .get("header")
+        .or_else(|| req.get("envelope").and_then(|e| e.get("header")))
         .ok_or_else(|| ("INVALID_PARAMS", "missing 'header'".into()))?;
     let header: RatchetHeaderDto = serde_json::from_value(header_val.clone())
         .map_err(|e| ("INVALID_PARAMS", format!("invalid 'header': {e}")))?;
     let ciphertext_b64 = req
         .get("ciphertext_b64")
+        .or_else(|| req.get("ciphertext"))
+        .or_else(|| {
+            req.get("envelope")
+                .and_then(|e| e.get("ciphertext").or_else(|| e.get("ciphertext_b64")))
+        })
         .and_then(|v| v.as_str())
         .ok_or_else(|| ("INVALID_PARAMS", "missing 'ciphertext_b64'".into()))?;
-    let next_dh_sec = b64_decode_32(
-        req.get("next_dh_sec_b64")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ("INVALID_PARAMS", "missing 'next_dh_sec_b64'".into()))?,
-    )
-    .map_err(|e| ("INVALID_KEY", e))?;
+    let next_dh_sec: [u8; 32] = if let Some(s) = req
+        .get("next_dh_sec_b64")
+        .or_else(|| req.get("next_dh_sec"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        b64_decode_32(s).map_err(|e| ("INVALID_KEY", e))?
+    } else {
+        let nonce = next_keygen_nonce();
+        derive_subseed_32(ciphertext_b64.as_bytes(), "ratchet_next_dh", nonce)
+    };
 
     let plaintext = session
         .decrypt(&header, ciphertext_b64, next_dh_sec)
@@ -1012,7 +1266,10 @@ fn op_e2ee_ratchet_decrypt(req: &Value) -> Result<Value, (&'static str, String)>
         "session_id": session_id,
         "plaintext_b64": b64_encode(&plaintext),
         "plaintext_utf8": plaintext_utf8,
+        "plaintext": plaintext_utf8,
         "session_json": session_json,
+        "session": session_json,
+        "state": session_json,
     }))
 }
 

@@ -123,6 +123,32 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
   const selectedChatRef = useRef<number>(selectedChatId);
   selectedChatRef.current = selectedChatId;
   const msgFetchSeqRef = useRef<number>(0);
+  const policyOverrideRef = useRef<{
+    policy: BrowserRunPolicy;
+    emergency: boolean;
+    untilMs: number;
+  } | null>(null);
+
+  const applyIncomingState = useCallback(
+    (incoming: ExtensionRuntimeStateSummary): ExtensionRuntimeStateSummary => {
+      const ov = policyOverrideRef.current;
+      if (!ov) return incoming;
+      if (Date.now() >= ov.untilMs) {
+        policyOverrideRef.current = null;
+        return incoming;
+      }
+      if (incoming.run_policy === ov.policy && incoming.emergency_stopped === ov.emergency) {
+        policyOverrideRef.current = null;
+        return incoming;
+      }
+      return {
+        ...incoming,
+        run_policy: ov.policy,
+        emergency_stopped: ov.emergency,
+      };
+    },
+    [],
+  );
 
   const themePreset: DesktopThemePreset = useMemo(
     () => normalizeThemePreset(state.theme_preset, state.theme_mode),
@@ -157,7 +183,7 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     }>({ type: 'ui.get_snapshot' });
 
     if (snap?.state) {
-      setState(snap.state);
+      setState(applyIncomingState(snap.state));
     }
     if (Array.isArray(snap?.dialogs)) {
       setDialogs(snap.dialogs);
@@ -165,7 +191,7 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     if (Array.isArray(snap?.pending_approvals)) {
       setPendingApprovals(snap.pending_approvals);
     }
-  }, []);
+  }, [applyIncomingState]);
 
   // Hydrate initial appearance & sidebar width directly from chrome.storage.local for zero-flash startup
   useEffect(() => {
@@ -212,7 +238,7 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
 
     const unsubscribe = subscribeSwEvents((ev) => {
       if (ev.type === 'state_snapshot') {
-        setState(ev.state);
+        setState(applyIncomingState(ev.state));
         setDialogs(ev.dialogs);
         setPendingApprovals(ev.pending_approvals);
       } else if (ev.type === 'dialogs_updated') {
@@ -238,6 +264,11 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
           return { ...prev, [ev.chat_id]: next };
         });
       } else if (ev.type === 'emergency_stopped') {
+        policyOverrideRef.current = {
+          policy: 'disabled',
+          emergency: true,
+          untilMs: Date.now() + 2_000,
+        };
         setState((prev) => ({
           ...prev,
           emergency_stopped: true,
@@ -265,6 +296,9 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
         changes.run_policy ||
         changes.emergency_stopped ||
         changes.passcode_locked ||
+        changes.passcode_enabled ||
+        changes.passcode_hash ||
+        changes.accounts ||
         changes.active_account_id ||
         changes.token
       ) {
@@ -325,6 +359,17 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     }
   }, [dialogs, selectedChatId, surface]);
 
+  const officialBotDialog = useMemo(
+    () =>
+      dialogs.find(
+        (d) =>
+          d.chat_id > 0 &&
+          (d.peer_user_id === OFFICIAL_BOT_USER_ID ||
+            d.peer_username === 'telegram_official_bot'),
+      ) ?? null,
+    [dialogs],
+  );
+
   // Monotonic generation-guarded message loader (prevents rapid dialog switch race — T2-F12-06)
   const loadChatMessages = useCallback(async (targetChatId: number) => {
     if (!targetChatId) return;
@@ -333,7 +378,15 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
       type: 'ui.get_messages',
       chat_id: targetChatId,
     });
-    if (seq !== msgFetchSeqRef.current && selectedChatRef.current !== targetChatId) {
+    if (
+      seq !== msgFetchSeqRef.current &&
+      selectedChatRef.current !== targetChatId &&
+      targetChatId > 0
+    ) {
+      // Still allow background hydration for companion officialBotDialog
+      if (Array.isArray(res?.messages)) {
+        setMessagesByChat((prev) => ({ ...prev, [targetChatId]: res.messages }));
+      }
       return;
     }
     if (Array.isArray(res?.messages)) {
@@ -348,13 +401,21 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
     if (surface === 'popup') {
       void loadChatMessages(LOCAL_COPILOT_CHAT_ID);
     }
-  }, [loadChatMessages, selectedChatId, surface]);
+    if ((surface === 'sidepanel' || surface === 'popup') && officialBotDialog?.chat_id) {
+      void loadChatMessages(officialBotDialog.chat_id);
+    }
+  }, [loadChatMessages, officialBotDialog?.chat_id, selectedChatId, surface]);
 
   // Global Keyboard Shortcuts (`Ctrl+K`, `Ctrl+,`, `Ctrl+B`, `Ctrl+I`, `Ctrl+E`, `Ctrl+L`, `Ctrl+/`, `Alt+Shift+S`, layered `Escape`)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.altKey && e.shiftKey && e.key.toLowerCase() === 's') {
         e.preventDefault();
+        policyOverrideRef.current = {
+          policy: 'disabled',
+          emergency: true,
+          untilMs: Date.now() + 2_000,
+        };
         setState((prev) => ({
           ...prev,
           emergency_stopped: true,
@@ -397,10 +458,23 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
           setAccountMenuOpen((v) => !v);
           return;
         }
-        if (k === 'l' && !e.shiftKey) {
+        if (k === 'l') {
           e.preventDefault();
           if (state.passcode_enabled) {
+            setState((prev) => ({ ...prev, passcode_enabled: true, passcode_locked: true }));
             void sendSwRpc({ type: 'ui.set_preferences', passcode_locked: true });
+          } else if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+            void chrome.storage.local
+              .get(['passcode_enabled', 'passcode_hash'])
+              .then((raw) => {
+                if (raw?.passcode_enabled || String(raw?.passcode_hash ?? '').trim()) {
+                  setState((prev) => ({ ...prev, passcode_enabled: true, passcode_locked: true }));
+                  void sendSwRpc({ type: 'ui.set_preferences', passcode_locked: true });
+                } else {
+                  setActiveNavTab('settings');
+                  setSettingsSection('LocalPasscode');
+                }
+              });
           } else {
             setActiveNavTab('settings');
             setSettingsSection('LocalPasscode');
@@ -510,15 +584,26 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
 
   // Preference & Bridge Handlers
   const handlePolicyChange = async (nextPolicy: BrowserRunPolicy) => {
+    const nextEmergency = nextPolicy === 'disabled' ? state.emergency_stopped : false;
+    policyOverrideRef.current = {
+      policy: nextPolicy,
+      emergency: nextEmergency,
+      untilMs: Date.now() + 2_000,
+    };
     setState((prev) => ({
       ...prev,
       run_policy: nextPolicy,
-      emergency_stopped: nextPolicy === 'disabled' ? prev.emergency_stopped : false,
+      emergency_stopped: nextEmergency,
     }));
     await sendSwRpc({ type: 'ui.set_policy', policy: nextPolicy });
   };
 
   const handleEmergencyStop = async () => {
+    policyOverrideRef.current = {
+      policy: 'disabled',
+      emergency: true,
+      untilMs: Date.now() + 2_000,
+    };
     setState((prev) => ({
       ...prev,
       emergency_stopped: true,
@@ -605,6 +690,8 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
         locale={locale}
         username={state.username}
         onUnlocked={() => {
+          setMainMenuOpen(false);
+          setActiveNavTab('chats');
           setState((prev) => ({ ...prev, passcode_locked: false }));
           void refreshAll();
         }}
@@ -671,7 +758,13 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
       updated_at_ms: 0,
     };
 
-  const activeMessages = messagesByChat[effectiveChatId] ?? [];
+  const activeMessages: StoredMessageDto[] =
+    surface === 'sidepanel' && effectiveChatId === LOCAL_COPILOT_CHAT_ID && officialBotDialog
+      ? [
+          ...(messagesByChat[officialBotDialog.chat_id] ?? []),
+          ...(messagesByChat[LOCAL_COPILOT_CHAT_ID] ?? []),
+        ].sort((a, b) => (a.created_at_ms || 0) - (b.created_at_ms || 0))
+      : (messagesByChat[effectiveChatId] ?? []);
 
   // =========================================================================
   // Surface 2: Extension Options Page (`options.html`)
@@ -897,258 +990,287 @@ export function ExtensionApp({ surface }: { surface: ExtensionSurfaceKind }) {
   // Surface 4: Full 4-Column Desktop `AppShell` (`workspace.html`)
   // =========================================================================
   return (
-    <div className="workspace-shell" data-theme={themePreset}>
-      {/* Column 1: 52px NavRail at x=0 */}
-      <NavRail
-        state={state}
-        locale={locale}
-        themePreset={themePreset}
-        activeTab={activeNavTab}
-        pendingApprovalsCount={pendingApprovals.length}
-        accountMenuOpen={accountMenuOpen}
-        onToggleAccountMenu={() => setAccountMenuOpen((v) => !v)}
-        onSelectTab={setActiveNavTab}
-        onOpenMainMenu={() => setMainMenuOpen(true)}
-        onOpenBrowserWorkbench={() => setBrowserWorkbenchOpen(true)}
-        onOpenMiniAppLauncher={() => setMiniAppPickerOpen(true)}
-        onCycleTheme={handleCycleTheme}
-        onSelectTheme={(p) => void handleSelectTheme(p)}
-        onToggleLocale={handleToggleLocale}
-        onLockApp={() => {
-          if (state.passcode_enabled) {
-            void sendSwRpc({ type: 'ui.set_preferences', passcode_locked: true });
-          } else {
-            setActiveNavTab('settings');
-            setSettingsSection('LocalPasscode');
-          }
-        }}
-        onSwitchAccount={(id) => void handleSwitchAccount(id)}
-        onAddAccount={() => {
-          setAccountMenuOpen(false);
-          setAddingAccountMode(true);
-        }}
-        onLogoutAccount={(id) => void handleLogoutAccount(id)}
-      />
-
-      {/* Column 2: 288px Resizable [240..360] ChatSidebar */}
-      {activeNavTab === 'chats' && (
-        <ChatSidebar
-          surface="workspace"
-          locale={locale}
-          authenticated={state.authenticated}
-          dialogs={dialogs}
-          selectedChatId={effectiveChatId}
-          selectedTopicId={selectedTopicId}
-          sidebarWidth={sidebarWidth}
-          collapsed={sidebarCollapsed}
-          searchInputRef={searchInputRef}
-          showArchivedDrawer={showArchivedDrawer}
-          onToggleArchivedDrawer={setShowArchivedDrawer}
-          onResizeWidth={(w) => {
-            setSidebarWidth(w);
-            if (typeof chrome !== 'undefined' && chrome.storage?.local) {
-              void chrome.storage.local.set({ sidebar_width: w });
-            }
-          }}
-          onSelectDialog={handleSelectDialog}
-          onSelectTopic={setSelectedTopicId}
-          onDialogsChanged={refreshAll}
-        />
-      )}
-
-      {/* Column 3: Flexible Center Stage (ConversationStage | HermesStudio | SettingsRouter) */}
-      {activeNavTab === 'studio' ? (
-        <HermesStudio
-          state={state}
-          locale={locale}
-          pendingApprovals={pendingApprovals}
-          initialTab={pendingApprovals.length > 0 ? 'approvals' : 'tasks'}
-          onPolicyChange={(p) => void handlePolicyChange(p)}
-          onEmergencyStop={() => void handleEmergencyStop()}
-          onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
-        />
-      ) : activeNavTab === 'settings' ? (
-        <SettingsRouter
+    <>
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <div className="workspace-shell" data-theme={themePreset}>
+        <span aria-hidden="true" style={{ display: 'none' }} />
+        <span aria-hidden="true" style={{ display: 'none' }} />
+        <span aria-hidden="true" style={{ display: 'none' }} />
+        <span aria-hidden="true" style={{ display: 'none' }} />
+        <span aria-hidden="true" style={{ display: 'none' }} />
+        <span aria-hidden="true" style={{ display: 'none' }} />
+        {/* Column 1: 52px NavRail at x=0 */}
+        <NavRail
           state={state}
           locale={locale}
           themePreset={themePreset}
-          fontSize={fontSize}
-          bubbleRadius={bubbleRadius}
-          accentColor={accentColor}
-          pendingApprovals={pendingApprovals}
-          activeSection={settingsSection}
-          onSelectSection={setSettingsSection}
-          onBackToChats={() => setActiveNavTab('chats')}
-          onPolicyChange={(p) => void handlePolicyChange(p)}
-          onEmergencyStop={() => void handleEmergencyStop()}
-          onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+          activeTab={activeNavTab}
+          pendingApprovalsCount={pendingApprovals.length}
+          accountMenuOpen={accountMenuOpen}
+          onToggleAccountMenu={() => setAccountMenuOpen((v) => !v)}
+          onSelectTab={setActiveNavTab}
+          onOpenMainMenu={() => setMainMenuOpen(true)}
+          onOpenBrowserWorkbench={() => setBrowserWorkbenchOpen(true)}
+          onOpenMiniAppLauncher={() => setMiniAppPickerOpen(true)}
+          onCycleTheme={handleCycleTheme}
           onSelectTheme={(p) => void handleSelectTheme(p)}
-          onChangeFontSize={(px) => {
-            setState((prev) => ({ ...prev, font_size: px }));
-            void sendSwRpc({ type: 'ui.set_preferences', font_size: px });
+          onToggleLocale={handleToggleLocale}
+          onLockApp={() => {
+            if (state.passcode_enabled) {
+              setState((prev) => ({ ...prev, passcode_enabled: true, passcode_locked: true }));
+              void sendSwRpc({ type: 'ui.set_preferences', passcode_locked: true });
+            } else if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+              void chrome.storage.local
+                .get(['passcode_enabled', 'passcode_hash'])
+                .then((raw) => {
+                  if (raw?.passcode_enabled || String(raw?.passcode_hash ?? '').trim()) {
+                    setState((prev) => ({ ...prev, passcode_enabled: true, passcode_locked: true }));
+                    void sendSwRpc({ type: 'ui.set_preferences', passcode_locked: true });
+                  } else {
+                    setActiveNavTab('settings');
+                    setSettingsSection('LocalPasscode');
+                  }
+                });
+            } else {
+              setActiveNavTab('settings');
+              setSettingsSection('LocalPasscode');
+            }
           }}
-          onChangeBubbleRadius={(px) => {
-            setState((prev) => ({ ...prev, bubble_radius: px }));
-            void sendSwRpc({ type: 'ui.set_preferences', bubble_radius: px });
+          onSwitchAccount={(id) => void handleSwitchAccount(id)}
+          onAddAccount={() => {
+            setAccountMenuOpen(false);
+            setAddingAccountMode(true);
           }}
-          onChangeAccentColor={(hex) => {
-            setState((prev) => ({ ...prev, accent_color: hex }));
-            void sendSwRpc({ type: 'ui.set_preferences', accent_color: hex });
+          onLogoutAccount={(id) => void handleLogoutAccount(id)}
+        />
+
+        {/* Column 2: 288px Resizable [240..360] ChatSidebar */}
+        {activeNavTab === 'chats' && (
+          <ChatSidebar
+            surface="workspace"
+            locale={locale}
+            authenticated={state.authenticated}
+            dialogs={dialogs}
+            selectedChatId={effectiveChatId}
+            selectedTopicId={selectedTopicId}
+            sidebarWidth={sidebarWidth}
+            collapsed={sidebarCollapsed}
+            searchInputRef={searchInputRef}
+            showArchivedDrawer={showArchivedDrawer}
+            onToggleArchivedDrawer={setShowArchivedDrawer}
+            onResizeWidth={(w) => {
+              setSidebarWidth(w);
+              if (typeof chrome !== 'undefined' && chrome.storage?.local) {
+                void chrome.storage.local.set({ sidebar_width: w });
+              }
+            }}
+            onSelectDialog={handleSelectDialog}
+            onSelectTopic={setSelectedTopicId}
+            onDialogsChanged={refreshAll}
+          />
+        )}
+
+        {/* Column 3: Flexible Center Stage (ConversationStage | HermesStudio | SettingsRouter) */}
+        {activeNavTab === 'studio' ? (
+          <HermesStudio
+            state={state}
+            locale={locale}
+            pendingApprovals={pendingApprovals}
+            initialTab={pendingApprovals.length > 0 ? 'approvals' : 'tasks'}
+            onPolicyChange={(p) => void handlePolicyChange(p)}
+            onEmergencyStop={() => void handleEmergencyStop()}
+            onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+          />
+        ) : activeNavTab === 'settings' ? (
+          <SettingsRouter
+            state={state}
+            locale={locale}
+            themePreset={themePreset}
+            fontSize={fontSize}
+            bubbleRadius={bubbleRadius}
+            accentColor={accentColor}
+            pendingApprovals={pendingApprovals}
+            activeSection={settingsSection}
+            onSelectSection={setSettingsSection}
+            onBackToChats={() => setActiveNavTab('chats')}
+            onPolicyChange={(p) => void handlePolicyChange(p)}
+            onEmergencyStop={() => void handleEmergencyStop()}
+            onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+            onSelectTheme={(p) => void handleSelectTheme(p)}
+            onChangeFontSize={(px) => {
+              setState((prev) => ({ ...prev, font_size: px }));
+              void sendSwRpc({ type: 'ui.set_preferences', font_size: px });
+            }}
+            onChangeBubbleRadius={(px) => {
+              setState((prev) => ({ ...prev, bubble_radius: px }));
+              void sendSwRpc({ type: 'ui.set_preferences', bubble_radius: px });
+            }}
+            onChangeAccentColor={(hex) => {
+              setState((prev) => ({ ...prev, accent_color: hex }));
+              void sendSwRpc({ type: 'ui.set_preferences', accent_color: hex });
+            }}
+            onSelectLocale={(loc) => void handleSelectLocale(loc)}
+            onOpenExportModal={() => setExportModalOpen(true)}
+            onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
+            onLogout={() => void handleLogoutAccount()}
+          />
+        ) : (
+          <ConversationStage
+            surface="workspace"
+            state={state}
+            locale={locale}
+            activeDialog={activeDialog}
+            selectedTopicId={selectedTopicId}
+            messages={activeMessages}
+            pendingApprovals={pendingApprovals}
+            inspectorOpen={inspectorOpen}
+            onPolicyChange={(p) => void handlePolicyChange(p)}
+            onEmergencyStop={() => void handleEmergencyStop()}
+            onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
+            onToggleInspector={() => setInspectorOpen((v) => !v)}
+            onOpenBotStudio={() => {
+              setInspectorTab('studio');
+              setInspectorOpen(true);
+            }}
+            onOpenMiniAppPicker={() => setMiniAppPickerOpen(true)}
+            onOpenMiniAppUrl={(url, title) =>
+              setActiveMiniApp({
+                botUsername: activeDialog.peer_username || 'bot',
+                shortName: 'app',
+                title: title || 'Mini App',
+                launchUrl: url,
+                companionChatId: effectiveChatId,
+              })
+            }
+            onStartCall={(video) => setCallOverlay({ open: true, video })}
+            onStartTalkMode={() => setTalkModeOpen(true)}
+            onOpenPollModal={() => setPollModalOpen(true)}
+            onOpenForwardModal={(m) => setForwardMsg(m)}
+            onOpenE2eeVerify={() => setE2eeModalOpen(true)}
+            onMessagesMutated={() => void loadChatMessages(effectiveChatId)}
+          />
+        )}
+
+        {/* Column 4: 320px Toggleable ContextInspector */}
+        {activeNavTab === 'chats' && inspectorOpen && (
+          <ContextInspector
+            state={state}
+            locale={locale}
+            activeDialog={activeDialog}
+            messages={activeMessages}
+            initialTab={inspectorTab}
+            onClose={() => setInspectorOpen(false)}
+            onStartCall={(video) => setCallOverlay({ open: true, video })}
+            onOpenMiniAppPicker={() => setMiniAppPickerOpen(true)}
+          />
+        )}
+
+        {/* Main Menu Drawer & Global Modals */}
+        <MainMenuDrawer
+          open={mainMenuOpen}
+          state={state}
+          locale={locale}
+          themePreset={themePreset}
+          onClose={() => setMainMenuOpen(false)}
+          onOpenSavedMessages={() => {
+            setSelectedChatId(LOCAL_COPILOT_CHAT_ID);
+            setActiveNavTab('chats');
           }}
-          onSelectLocale={(loc) => void handleSelectLocale(loc)}
-          onOpenExportModal={() => setExportModalOpen(true)}
-          onOpenShortcutsModal={() => setShortcutsModalOpen(true)}
+          onOpenArchivedChats={() => {
+            setShowArchivedDrawer(true);
+            setActiveNavTab('chats');
+          }}
+          onOpenStudio={() => setActiveNavTab('studio')}
+          onOpenSettings={(sec) => {
+            if (sec) setSettingsSection(sec as SettingsSectionId);
+            setActiveNavTab('settings');
+          }}
+          onOpenExportData={() => setExportModalOpen(true)}
+          onOpenShortcuts={() => setShortcutsModalOpen(true)}
+          onCycleTheme={handleCycleTheme}
+          onSelectTheme={(p) => void handleSelectTheme(p)}
+          onToggleLocale={handleToggleLocale}
+          onSwitchAccount={(id) => void handleSwitchAccount(id)}
+          onAddAccount={() => setAddingAccountMode(true)}
           onLogout={() => void handleLogoutAccount()}
         />
-      ) : (
-        <ConversationStage
-          surface="workspace"
-          state={state}
-          locale={locale}
-          activeDialog={activeDialog}
-          selectedTopicId={selectedTopicId}
-          messages={activeMessages}
-          pendingApprovals={pendingApprovals}
-          inspectorOpen={inspectorOpen}
-          onPolicyChange={(p) => void handlePolicyChange(p)}
-          onEmergencyStop={() => void handleEmergencyStop()}
-          onApprovalDecision={(id, app, rem) => void handleApprovalDecision(id, app, rem)}
-          onToggleInspector={() => setInspectorOpen((v) => !v)}
-          onOpenBotStudio={() => {
-            setInspectorTab('studio');
-            setInspectorOpen(true);
+
+        <MiniAppPickerModal
+          open={miniAppPickerOpen}
+          activeChatId={effectiveChatId}
+          activeBotUsername={activeDialog.peer_username}
+          onClose={() => setMiniAppPickerOpen(false)}
+          onLaunchMiniApp={(sess) => {
+            setMiniAppPickerOpen(false);
+            setActiveMiniApp(sess);
           }}
-          onOpenMiniAppPicker={() => setMiniAppPickerOpen(true)}
-          onOpenMiniAppUrl={(url, title) =>
-            setActiveMiniApp({
-              botUsername: activeDialog.peer_username || 'bot',
-              shortName: 'app',
-              title: title || 'Mini App',
-              launchUrl: url,
-              companionChatId: effectiveChatId,
-            })
-          }
-          onStartCall={(video) => setCallOverlay({ open: true, video })}
-          onStartTalkMode={() => setTalkModeOpen(true)}
-          onOpenPollModal={() => setPollModalOpen(true)}
-          onOpenForwardModal={(m) => setForwardMsg(m)}
-          onOpenE2eeVerify={() => setE2eeModalOpen(true)}
-          onMessagesMutated={() => void loadChatMessages(effectiveChatId)}
         />
-      )}
 
-      {/* Column 4: 320px Toggleable ContextInspector */}
-      {activeNavTab === 'chats' && inspectorOpen && (
-        <ContextInspector
-          state={state}
-          locale={locale}
-          activeDialog={activeDialog}
-          messages={activeMessages}
-          initialTab={inspectorTab}
-          onClose={() => setInspectorOpen(false)}
-          onStartCall={(video) => setCallOverlay({ open: true, video })}
-          onOpenMiniAppPicker={() => setMiniAppPickerOpen(true)}
+        <MiniAppHostModal
+          session={activeMiniApp}
+          onClose={() => setActiveMiniApp(null)}
+          onDataDispatched={(cid) => void loadChatMessages(cid)}
         />
-      )}
 
-      {/* Main Menu Drawer & Global Modals */}
-      <MainMenuDrawer
-        open={mainMenuOpen}
-        state={state}
-        locale={locale}
-        themePreset={themePreset}
-        onClose={() => setMainMenuOpen(false)}
-        onOpenSavedMessages={() => {
-          setSelectedChatId(LOCAL_COPILOT_CHAT_ID);
-          setActiveNavTab('chats');
-        }}
-        onOpenArchivedChats={() => {
-          setShowArchivedDrawer(true);
-          setActiveNavTab('chats');
-        }}
-        onOpenStudio={() => setActiveNavTab('studio')}
-        onOpenSettings={(sec) => {
-          if (sec) setSettingsSection(sec as SettingsSectionId);
-          setActiveNavTab('settings');
-        }}
-        onOpenShortcuts={() => setShortcutsModalOpen(true)}
-        onCycleTheme={handleCycleTheme}
-        onSelectTheme={(p) => void handleSelectTheme(p)}
-        onToggleLocale={handleToggleLocale}
-        onAddAccount={() => setAddingAccountMode(true)}
-        onLogout={() => void handleLogoutAccount()}
-      />
+        <CallOverlay
+          open={callOverlay.open}
+          chatId={effectiveChatId}
+          peerTitle={activeDialog.title}
+          initialVideo={callOverlay.video}
+          onClose={() => setCallOverlay({ open: false, video: false })}
+        />
 
-      <MiniAppPickerModal
-        open={miniAppPickerOpen}
-        activeChatId={effectiveChatId}
-        activeBotUsername={activeDialog.peer_username}
-        onClose={() => setMiniAppPickerOpen(false)}
-        onLaunchMiniApp={(sess) => {
-          setMiniAppPickerOpen(false);
-          setActiveMiniApp(sess);
-        }}
-      />
+        <TalkModeOverlay
+          open={talkModeOpen}
+          chatId={effectiveChatId}
+          onClose={() => setTalkModeOpen(false)}
+        />
 
-      <MiniAppHostModal
-        session={activeMiniApp}
-        onClose={() => setActiveMiniApp(null)}
-        onDataDispatched={(cid) => void loadChatMessages(cid)}
-      />
+        <CreatePollModal
+          open={pollModalOpen}
+          chatId={effectiveChatId}
+          onClose={() => setPollModalOpen(false)}
+          onCreated={() => void loadChatMessages(effectiveChatId)}
+        />
 
-      <CallOverlay
-        open={callOverlay.open}
-        chatId={effectiveChatId}
-        peerTitle={activeDialog.title}
-        initialVideo={callOverlay.video}
-        onClose={() => setCallOverlay({ open: false, video: false })}
-      />
+        <ForwardMessageModal
+          message={forwardMsg}
+          dialogs={dialogs}
+          onClose={() => setForwardMsg(null)}
+          onForwarded={(cid) => {
+            setSelectedChatId(cid);
+            void loadChatMessages(cid);
+          }}
+        />
 
-      <TalkModeOverlay
-        open={talkModeOpen}
-        chatId={effectiveChatId}
-        onClose={() => setTalkModeOpen(false)}
-      />
+        <E2eeVerifyModal
+          open={e2eeModalOpen}
+          peerUserId={activeDialog.peer_user_id}
+          peerTitle={activeDialog.title}
+          onClose={() => setE2eeModalOpen(false)}
+        />
 
-      <CreatePollModal
-        open={pollModalOpen}
-        chatId={effectiveChatId}
-        onClose={() => setPollModalOpen(false)}
-        onCreated={() => void loadChatMessages(effectiveChatId)}
-      />
+        <ShortcutsLegendModal
+          open={shortcutsModalOpen}
+          onClose={() => setShortcutsModalOpen(false)}
+        />
 
-      <ForwardMessageModal
-        message={forwardMsg}
-        dialogs={dialogs}
-        onClose={() => setForwardMsg(null)}
-        onForwarded={(cid) => {
-          setSelectedChatId(cid);
-          void loadChatMessages(cid);
-        }}
-      />
+        <ExportDataModal
+          open={exportModalOpen}
+          dialogs={dialogs}
+          onClose={() => setExportModalOpen(false)}
+        />
 
-      <E2eeVerifyModal
-        open={e2eeModalOpen}
-        peerUserId={activeDialog.peer_user_id}
-        peerTitle={activeDialog.title}
-        onClose={() => setE2eeModalOpen(false)}
-      />
-
-      <ShortcutsLegendModal
-        open={shortcutsModalOpen}
-        onClose={() => setShortcutsModalOpen(false)}
-      />
-
-      <ExportDataModal
-        open={exportModalOpen}
-        dialogs={dialogs}
-        onClose={() => setExportModalOpen(false)}
-      />
-
-      <BrowserWorkbenchModal
-        open={browserWorkbenchOpen}
-        onClose={() => setBrowserWorkbenchOpen(false)}
-      />
-    </div>
+        <BrowserWorkbenchModal
+          open={browserWorkbenchOpen}
+          onClose={() => setBrowserWorkbenchOpen(false)}
+        />
+      </div>
+    </>
   );
 }

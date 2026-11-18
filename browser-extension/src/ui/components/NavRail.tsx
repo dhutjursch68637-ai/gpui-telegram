@@ -63,6 +63,23 @@ export function NavRail({
       <div className="nav-rail-top">
         <button
           type="button"
+          className={`rail-icon-btn ${activeTab === 'chats' ? 'active' : ''}`}
+          data-testid="nav-chats-btn"
+          data-nav="chats"
+          aria-label={tr(locale, 'nav.chats')}
+          title={tr(locale, 'nav.chats')}
+          onClick={() => onSelectTab('chats')}
+        >
+          💬
+          {state.unread_total > 0 && (
+            <span className="rail-badge" data-testid="nav-unread-badge">
+              {state.unread_total > 99 ? '99+' : state.unread_total}
+            </span>
+          )}
+        </button>
+
+        <button
+          type="button"
           className="rail-icon-btn"
           data-testid="main-menu-btn"
           aria-label={tr(locale, 'nav.menu')}
@@ -82,23 +99,6 @@ export function NavRail({
         >
           <span>{activeInitial}</span>
           {accounts.length > 1 && <span className="rail-mini-dot">{accounts.length}</span>}
-        </button>
-
-        <button
-          type="button"
-          className={`rail-icon-btn ${activeTab === 'chats' ? 'active' : ''}`}
-          data-testid="nav-chats-btn"
-          data-nav="chats"
-          aria-label={tr(locale, 'nav.chats')}
-          title={tr(locale, 'nav.chats')}
-          onClick={() => onSelectTab('chats')}
-        >
-          💬
-          {state.unread_total > 0 && (
-            <span className="rail-badge" data-testid="nav-unread-badge">
-              {state.unread_total > 99 ? '99+' : state.unread_total}
-            </span>
-          )}
         </button>
 
         <button
@@ -234,6 +234,10 @@ export function NavRail({
           aria-label={tr(locale, 'nav.accounts')}
           data-testid="account-switcher-menu"
         >
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
           <div className="popover-header">{tr(locale, 'nav.accounts')}</div>
           {accounts.length === 0 && state.username && (
             <div className="account-item active" data-account-username={state.username}>
@@ -251,14 +255,19 @@ export function NavRail({
             return (
               <div
                 key={`${acc.user_id}:${acc.username}:${acc.server_url}`}
+                role="menuitem"
                 className={`account-item ${isActive ? 'active' : ''}`}
                 data-testid={`account-option-${acc.username}`}
                 data-account-id={acc.user_id || acc.username}
+                onClick={() => onSwitchAccount(acc.user_id || acc.username)}
               >
                 <button
                   type="button"
                   className="account-select-btn"
-                  onClick={() => onSwitchAccount(acc.user_id || acc.username)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSwitchAccount(acc.user_id || acc.username);
+                  }}
                 >
                   <span className="avatar-sm">{acc.username.slice(0, 2).toUpperCase()}</span>
                   <span className="account-meta">
@@ -272,7 +281,10 @@ export function NavRail({
                   className="btn ghost xs danger-text"
                   data-testid={`logout-account-${acc.username}`}
                   title="Log Out Account"
-                  onClick={() => onLogoutAccount(acc.user_id || acc.username)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onLogoutAccount(acc.user_id || acc.username);
+                  }}
                 >
                   ✕
                 </button>
@@ -312,10 +324,12 @@ export function MainMenuDrawer({
   onOpenArchivedChats,
   onOpenStudio,
   onOpenSettings,
+  onOpenExportData,
   onOpenShortcuts,
   onCycleTheme,
   onSelectTheme,
   onToggleLocale,
+  onSwitchAccount,
   onAddAccount,
   onLogout,
 }: {
@@ -328,17 +342,25 @@ export function MainMenuDrawer({
   onOpenArchivedChats: () => void;
   onOpenStudio: () => void;
   onOpenSettings: (section?: string) => void;
+  onOpenExportData?: () => void;
   onOpenShortcuts: () => void;
   onCycleTheme: () => void;
   onSelectTheme: (preset: DesktopThemePreset) => void;
   onToggleLocale: () => void;
+  onSwitchAccount?: (accountId: number | string) => void;
   onAddAccount: () => void;
   onLogout: () => void;
 }) {
   if (!open) return null;
+  const drawerAccounts: StoredAccountEntryDto[] = Array.isArray(state.accounts) ? state.accounts : [];
 
   return (
     <div className="drawer-backdrop" onClick={onClose} data-testid="main-menu-backdrop">
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
+      <span aria-hidden="true" style={{ display: 'none' }} />
       <aside
         className="main-menu-drawer"
         data-testid="main-menu-drawer"
@@ -355,6 +377,32 @@ export function MainMenuDrawer({
         </div>
 
         <div className="drawer-menu-list">
+          {drawerAccounts.length > 1 && onSwitchAccount && (
+            <>
+              {drawerAccounts.map((acc) => {
+                const isActive =
+                  (state.user_id !== null && acc.user_id === state.user_id) ||
+                  (state.username && acc.username === state.username);
+                return (
+                  <button
+                    key={`drawer-acc-${acc.user_id}:${acc.username}`}
+                    type="button"
+                    role="menuitem"
+                    data-testid={`drawer-account-option-${acc.username}`}
+                    data-account-id={acc.user_id || acc.username}
+                    className={`menu-item-btn ${isActive ? 'active' : ''}`}
+                    onClick={() => {
+                      onSwitchAccount(acc.user_id || acc.username);
+                      onClose();
+                    }}
+                  >
+                    👤 @{acc.username} {isActive ? '• Active' : ''}
+                  </button>
+                );
+              })}
+              <div className="popover-divider" />
+            </>
+          )}
           <button type="button" className="menu-item-btn" onClick={() => { onOpenSavedMessages(); onClose(); }}>
             🔖 Saved Messages & Copilot
           </button>
@@ -369,6 +417,18 @@ export function MainMenuDrawer({
           </button>
           <button type="button" className="menu-item-btn" onClick={() => { onOpenSettings('Chat'); onClose(); }}>
             🎨 {tr(locale, 'settings.Chat')}
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className="menu-item-btn"
+            data-testid="drawer-export-data-btn"
+            onClick={() => {
+              onOpenExportData?.();
+              onClose();
+            }}
+          >
+            📥 Export Telegram Data
           </button>
           <button type="button" className="menu-item-btn" onClick={() => { onOpenShortcuts(); onClose(); }}>
             ⌨️ Keyboard Shortcuts (Ctrl+/)

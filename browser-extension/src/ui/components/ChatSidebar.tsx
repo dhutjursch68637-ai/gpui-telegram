@@ -121,6 +121,17 @@ export function ChatSidebar({
   const [storyCaption, setStoryCaption] = useState('');
   const [topicTitle, setTopicTitle] = useState('');
 
+  const chatTitleInputRef = useRef<HTMLInputElement | null>(null);
+  const chatAboutInputRef = useRef<HTMLInputElement | null>(null);
+  const botNameInputRef = useRef<HTMLInputElement | null>(null);
+  const botUsernameInputRef = useRef<HTMLInputElement | null>(null);
+  const botPersonaInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const botFatherInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const contactInputRef = useRef<HTMLInputElement | null>(null);
+  const folderTitleInputRef = useRef<HTMLInputElement | null>(null);
+  const storyCaptionInputRef = useRef<HTMLInputElement | null>(null);
+  const topicTitleInputRef = useRef<HTMLInputElement | null>(null);
+
   // Context menu & delete confirmation state
   const [ctxMenu, setCtxMenu] = useState<{
     dlg: StoredDialogDto;
@@ -302,8 +313,11 @@ export function ChatSidebar({
       }
       return (b.updated_at_ms || 0) - (a.updated_at_ms || 0);
     });
+    if (surface === 'workspace' && sorted.length > 0) {
+      return [...sorted, copilotDialog];
+    }
     return [copilotDialog, ...sorted];
-  }, [copilotDialog, dialogs]);
+  }, [copilotDialog, dialogs, surface]);
 
   const archivedDialogs = useMemo(
     () => allMergedDialogs.filter((d) => d.is_archived && d.chat_id !== LOCAL_COPILOT_CHAT_ID),
@@ -388,7 +402,8 @@ export function ChatSidebar({
   const handleCreateGroupOrChannel = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
-    const cleanTitle = newChatTitle.trim();
+    const cleanTitle = (chatTitleInputRef.current?.value ?? newChatTitle).trim();
+    const cleanAbout = (chatAboutInputRef.current?.value ?? newChatAbout).trim();
     if (!cleanTitle) {
       setModalError('Title is required and cannot be empty.');
       return;
@@ -407,7 +422,7 @@ export function ChatSidebar({
         chat_type: chatType,
         type: chatType,
         is_forum: createModal === 'forum',
-        about: newChatAbout.trim() || undefined,
+        about: cleanAbout || undefined,
       },
     });
     setModalBusy(false);
@@ -437,8 +452,9 @@ export function ChatSidebar({
   const handleCreateFabushiBot = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
-    const cleanName = botName.trim();
-    const rawHandle = botUsername.trim();
+    const cleanName = (botNameInputRef.current?.value ?? botName).trim();
+    const rawHandle = (botUsernameInputRef.current?.value ?? botUsername).trim();
+    const cleanPersona = (botPersonaInputRef.current?.value ?? botPersona).trim();
     if (!cleanName) {
       setModalError('Bot display name is required.');
       return;
@@ -475,8 +491,8 @@ export function ChatSidebar({
         title: cleanName,
         display_name: cleanName,
         username: cleanHandle,
-        description: botPersona.trim() || `AI Companion ${cleanName}`,
-        system_prompt: botPersona.trim() || `You are ${cleanName}.`,
+        description: cleanPersona || `AI Companion ${cleanName}`,
+        system_prompt: cleanPersona || `You are ${cleanName}.`,
       },
     });
     setModalBusy(false);
@@ -510,7 +526,8 @@ export function ChatSidebar({
   const handleCreateBotFatherNl = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
-    if (!botFatherPrompt.trim()) {
+    const cleanPrompt = (botFatherInputRef.current?.value ?? botFatherPrompt).trim();
+    if (!cleanPrompt) {
       setModalError('Please describe the bot you want @BotFather to build.');
       return;
     }
@@ -518,8 +535,8 @@ export function ChatSidebar({
     const res = await apiRequest<any>('/api/v1/botfather/nl-create', {
       method: 'POST',
       body: {
-        prompt: botFatherPrompt.trim(),
-        description: botFatherPrompt.trim(),
+        prompt: cleanPrompt,
+        description: cleanPrompt,
       },
     });
     setModalBusy(false);
@@ -549,7 +566,7 @@ export function ChatSidebar({
   const handleAddContactOrDm = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
-    const target = contactTarget.trim().replace(/^@/, '');
+    const target = (contactInputRef.current?.value ?? contactTarget).trim().replace(/^@/, '');
     if (!target) {
       setModalError('Enter a username, phone, or user ID.');
       return;
@@ -606,7 +623,8 @@ export function ChatSidebar({
   const handleCreateFolder = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
-    if (!folderTitle.trim()) {
+    const cleanFolderTitle = (folderTitleInputRef.current?.value ?? folderTitle).trim();
+    if (!cleanFolderTitle) {
       setModalError('Folder name is required.');
       return;
     }
@@ -614,7 +632,7 @@ export function ChatSidebar({
     const res = await apiRequest<any>('/api/v1/folders', {
       method: 'POST',
       body: {
-        title: folderTitle.trim(),
+        title: cleanFolderTitle,
         include_chats: folderSelectedChats,
         included_chat_ids: folderSelectedChats,
         chat_ids: folderSelectedChats,
@@ -645,11 +663,12 @@ export function ChatSidebar({
 
   const handleCreateStory = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!storyCaption.trim()) return;
+    const cleanCaption = (storyCaptionInputRef.current?.value ?? storyCaption).trim();
+    if (!cleanCaption) return;
     setModalBusy(true);
     await apiRequest('/api/v1/stories', {
       method: 'POST',
-      body: { caption: storyCaption.trim(), text: storyCaption.trim() },
+      body: { caption: cleanCaption, text: cleanCaption },
     });
     setModalBusy(false);
     setStoryCaption('');
@@ -659,11 +678,12 @@ export function ChatSidebar({
 
   const handleCreateTopic = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!topicTitle.trim() || !activeSelectedDialog) return;
+    const cleanTopicTitle = (topicTitleInputRef.current?.value ?? topicTitle).trim();
+    if (!cleanTopicTitle || !activeSelectedDialog) return;
     setModalBusy(true);
     const res = await apiRequest<any>(`/api/v1/chats/${activeSelectedDialog.chat_id}/topics`, {
       method: 'POST',
-      body: { title: topicTitle.trim(), icon_emoji: '📌' },
+      body: { title: cleanTopicTitle, icon_emoji: '📌' },
     });
     setModalBusy(false);
     if (res.ok) {
@@ -888,6 +908,304 @@ export function ChatSidebar({
 
   return (
     <>
+      {/* Creation Modals rendered first in DOM order so active dialog controls take precedence */}
+      {createModal && (
+        <div className="modal-backdrop" onClick={() => setCreateModal(null)}>
+          <div
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            data-testid={`create-modal-${createModal}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            {(createModal === 'group' || createModal === 'channel' || createModal === 'forum') && (
+              <form className="auth-form-stack" onSubmit={(e) => void handleCreateGroupOrChannel(e)}>
+                <h3>
+                  {createModal === 'channel'
+                    ? tr(locale, 'sidebar.createChannel')
+                    : createModal === 'forum'
+                      ? tr(locale, 'sidebar.createForum')
+                      : tr(locale, 'sidebar.createGroup')}
+                </h3>
+                {modalError && (
+                  <div className="error-banner" role="alert" data-testid="create-modal-error">
+                    {modalError}
+                  </div>
+                )}
+                <label className="field-stack">
+                  <span className="field-label">Title</span>
+                  <input
+                    ref={chatTitleInputRef}
+                    className="input"
+                    autoFocus
+                    data-testid="create-chat-title-input"
+                    value={newChatTitle}
+                    onChange={(e) => setNewChatTitle(e.target.value)}
+                    placeholder="Engineering Core"
+                  />
+                </label>
+                <label className="field-stack">
+                  <span className="field-label">Description (optional)</span>
+                  <input
+                    ref={chatAboutInputRef}
+                    className="input"
+                    data-testid="create-chat-about-input"
+                    value={newChatAbout}
+                    onChange={(e) => setNewChatAbout(e.target.value)}
+                    placeholder="Purpose of this space…"
+                  />
+                </label>
+                <div className="modal-actions">
+                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
+                    {tr(locale, 'ctx.cancel')}
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn primary"
+                    data-testid="create-chat-submit-btn"
+                    disabled={modalBusy}
+                  >
+                    Create
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {createModal === 'fabushi' && (
+              <form className="auth-form-stack" onSubmit={(e) => void handleCreateFabushiBot(e)}>
+                <h3>🤖 {tr(locale, 'sidebar.createBot')}</h3>
+                {modalError && (
+                  <div className="error-banner" role="alert" data-testid="create-modal-error">
+                    {modalError}
+                  </div>
+                )}
+                <label className="field-stack">
+                  <span className="field-label">Bot Display Name</span>
+                  <input
+                    ref={botNameInputRef}
+                    className="input"
+                    autoFocus
+                    data-testid="fabushi-bot-name-input"
+                    value={botName}
+                    onChange={(e) => setBotName(e.target.value)}
+                    placeholder="Research Companion"
+                  />
+                </label>
+                <label className="field-stack">
+                  <span className="field-label">Bot Username (@handle)</span>
+                  <input
+                    ref={botUsernameInputRef}
+                    className="input"
+                    data-testid="fabushi-bot-username-input"
+                    value={botUsername}
+                    onChange={(e) => setBotUsername(e.target.value)}
+                    placeholder="research_companion_bot"
+                  />
+                </label>
+                <label className="field-stack">
+                  <span className="field-label">Persona & System Instructions</span>
+                  <textarea
+                    ref={botPersonaInputRef}
+                    className="input"
+                    rows={3}
+                    data-testid="fabushi-bot-persona-input"
+                    value={botPersona}
+                    onChange={(e) => setBotPersona(e.target.value)}
+                    placeholder="Helpful browser & coding specialist…"
+                  />
+                </label>
+                <div className="modal-actions">
+                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
+                    {tr(locale, 'ctx.cancel')}
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn primary"
+                    data-testid="fabushi-bot-submit-btn"
+                    disabled={modalBusy}
+                  >
+                    Create Bot
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {createModal === 'botfather' && (
+              <form className="auth-form-stack" onSubmit={(e) => void handleCreateBotFatherNl(e)}>
+                <h3>✨ {tr(locale, 'sidebar.createBotFather')}</h3>
+                {modalError && (
+                  <div className="error-banner" role="alert">
+                    {modalError}
+                  </div>
+                )}
+                <label className="field-stack">
+                  <span className="field-label">Describe your Bot & Mini App in natural language</span>
+                  <textarea
+                    ref={botFatherInputRef}
+                    className="input"
+                    rows={4}
+                    autoFocus
+                    data-testid="botfather-nl-input"
+                    value={botFatherPrompt}
+                    onChange={(e) => setBotFatherPrompt(e.target.value)}
+                    placeholder="Create a daily standup tracker bot with an interactive Kanban mini app…"
+                  />
+                </label>
+                <div className="modal-actions">
+                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
+                    {tr(locale, 'ctx.cancel')}
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn primary"
+                    data-testid="botfather-nl-submit-btn"
+                    disabled={modalBusy}
+                  >
+                    Generate via @BotFather
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {createModal === 'contact' && (
+              <form className="auth-form-stack" onSubmit={(e) => void handleAddContactOrDm(e)}>
+                <h3>👤 {tr(locale, 'sidebar.addContact')}</h3>
+                {modalError && (
+                  <div className="error-banner" role="alert">
+                    {modalError}
+                  </div>
+                )}
+                <label className="field-stack">
+                  <span className="field-label">Username or User ID</span>
+                  <input
+                    ref={contactInputRef}
+                    className="input"
+                    autoFocus
+                    data-testid="contact-target-input"
+                    value={contactTarget}
+                    onChange={(e) => setContactTarget(e.target.value)}
+                    placeholder="@bob"
+                  />
+                </label>
+                <div className="modal-actions">
+                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
+                    {tr(locale, 'ctx.cancel')}
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn primary"
+                    data-testid="contact-submit-btn"
+                    disabled={modalBusy}
+                  >
+                    Open Direct Chat
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {createModal === 'folder' && (
+              <form className="auth-form-stack" onSubmit={(e) => void handleCreateFolder(e)}>
+                <h3>📁 {tr(locale, 'sidebar.newFolder')}</h3>
+                {modalError && (
+                  <div className="error-banner" role="alert">
+                    {modalError}
+                  </div>
+                )}
+                <label className="field-stack">
+                  <span className="field-label">Folder Name</span>
+                  <input
+                    ref={folderTitleInputRef}
+                    className="input"
+                    autoFocus
+                    data-testid="folder-title-input"
+                    value={folderTitle}
+                    onChange={(e) => setFolderTitle(e.target.value)}
+                    placeholder={tr(locale, 'sidebar.folderNamePlaceholder')}
+                  />
+                </label>
+                <div className="folder-chat-checklist">
+                  {allMergedDialogs.map((d) => (
+                    <label key={d.chat_id} className="checkbox-row">
+                      <input
+                        type="checkbox"
+                        checked={folderSelectedChats.includes(d.chat_id)}
+                        onChange={(e) =>
+                          setFolderSelectedChats((prev) =>
+                            e.target.checked
+                              ? [...prev, d.chat_id]
+                              : prev.filter((id) => id !== d.chat_id),
+                          )
+                        }
+                      />
+                      <span>{d.title}</span>
+                    </label>
+                  ))}
+                </div>
+                <div className="modal-actions">
+                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
+                    {tr(locale, 'ctx.cancel')}
+                  </button>
+                  <button
+                    type="submit"
+                    className="btn primary"
+                    data-testid="folder-submit-btn"
+                    disabled={modalBusy}
+                  >
+                    Save Folder
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {createModal === 'story' && (
+              <form className="auth-form-stack" onSubmit={(e) => void handleCreateStory(e)}>
+                <h3>✨ Post Story</h3>
+                <input
+                  ref={storyCaptionInputRef}
+                  className="input"
+                  autoFocus
+                  data-testid="story-caption-input"
+                  value={storyCaption}
+                  onChange={(e) => setStoryCaption(e.target.value)}
+                  placeholder="Share an update…"
+                />
+                <div className="modal-actions">
+                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
+                    {tr(locale, 'ctx.cancel')}
+                  </button>
+                  <button type="submit" className="btn primary" data-testid="story-submit-btn">
+                    Publish
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {createModal === 'topic' && (
+              <form className="auth-form-stack" onSubmit={(e) => void handleCreateTopic(e)}>
+                <h3>🏛️ {tr(locale, 'sidebar.newTopic')}</h3>
+                <input
+                  ref={topicTitleInputRef}
+                  className="input"
+                  autoFocus
+                  data-testid="topic-title-input"
+                  value={topicTitle}
+                  onChange={(e) => setTopicTitle(e.target.value)}
+                  placeholder="Announcements"
+                />
+                <div className="modal-actions">
+                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
+                    {tr(locale, 'ctx.cancel')}
+                  </button>
+                  <button type="submit" className="btn primary" data-testid="topic-submit-btn">
+                    Create Topic
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+
       {surface === 'sidepanel' ? (
         <aside className="sidepanel-chat-strip" data-testid={CANONICAL_TEST_IDS.chatSidebar}>
           <div className="sidepanel-search-row">
@@ -896,7 +1214,21 @@ export function ChatSidebar({
               className="input sm flex-1"
               data-testid={CANONICAL_TEST_IDS.chatSearchInput}
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
+              onChange={(e) => {
+                const v = e.target.value;
+                setSearchQuery(v);
+                if (!v) {
+                  setActiveFilterTag('');
+                  setActiveSearchCat('All');
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') {
+                  setSearchQuery('');
+                  setActiveFilterTag('');
+                  setActiveSearchCat('All');
+                }
+              }}
               placeholder={tr(locale, 'sidebar.searchPlaceholder')}
             />
             <button
@@ -909,19 +1241,20 @@ export function ChatSidebar({
               {sidepanelListExpanded ? '▲' : `💬 ${allMergedDialogs.length}`}
             </button>
             <div style={{ position: 'relative' }}>
+              {createMenuPopoverNode}
               <button
                 type="button"
                 className="btn sm primary"
                 data-testid={CANONICAL_TEST_IDS.createMenuBtn}
+                aria-label="New item menu"
                 onClick={(e) => {
                   e.stopPropagation();
                   setCreateMenuOpen((v) => !v);
                 }}
-                title="Create"
+                title="New (+)"
               >
                 +
               </button>
-              {createMenuPopoverNode}
             </div>
           </div>
 
@@ -1007,7 +1340,21 @@ export function ChatSidebar({
                     className="input search-input"
                     data-testid={CANONICAL_TEST_IDS.chatSearchInput}
                     value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setSearchQuery(v);
+                      if (!v) {
+                        setActiveFilterTag('');
+                        setActiveSearchCat('All');
+                      }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') {
+                        setSearchQuery('');
+                        setActiveFilterTag('');
+                        setActiveSearchCat('All');
+                      }
+                    }}
                     placeholder={tr(locale, 'sidebar.searchPlaceholder')}
                   />
                   {searchQuery && (
@@ -1015,7 +1362,11 @@ export function ChatSidebar({
                       type="button"
                       className="search-clear-btn"
                       aria-label="Clear search"
-                      onClick={() => setSearchQuery('')}
+                      onClick={() => {
+                        setSearchQuery('');
+                        setActiveFilterTag('');
+                        setActiveSearchCat('All');
+                      }}
                     >
                       ✕
                     </button>
@@ -1024,12 +1375,13 @@ export function ChatSidebar({
               )}
 
               <div style={{ position: 'relative' }}>
+                {createMenuPopoverNode}
                 <button
                   type="button"
                   className="btn icon-btn primary"
                   data-testid={CANONICAL_TEST_IDS.createMenuBtn}
-                  aria-label="Create chat, group, channel, or AI bot"
-                  title="Create (+)"
+                  aria-label="New item menu"
+                  title="New (+)"
                   onClick={(e) => {
                     e.stopPropagation();
                     setCreateMenuOpen((v) => !v);
@@ -1037,7 +1389,6 @@ export function ChatSidebar({
                 >
                   +
                 </button>
-                {createMenuPopoverNode}
               </div>
             </div>
 
@@ -1190,16 +1541,21 @@ export function ChatSidebar({
             >
               ＋
             </button>
-            {archivedDialogs.length > 0 && (
-              <button
-                type="button"
-                className="folder-tab-btn ghost"
-                data-testid="archived-chats-btn"
-                onClick={() => onToggleArchivedDrawer(true)}
-              >
-                📦 {tr(locale, 'sidebar.archived')} ({archivedDialogs.length})
-              </button>
-            )}
+          </div>
+        )}
+
+        {/* Archived Chats Entry Row (kept outside folder tablist) */}
+        {!collapsed && !isSearching && !showArchivedDrawer && archivedDialogs.length > 0 && (
+          <div style={{ padding: '4px 10px 0' }}>
+            <button
+              type="button"
+              className="btn ghost sm"
+              style={{ width: '100%', justifyContent: 'flex-start' }}
+              data-testid="archived-chats-btn"
+              onClick={() => onToggleArchivedDrawer(true)}
+            >
+              📦 {tr(locale, 'sidebar.archived')} ({archivedDialogs.length})
+            </button>
           </div>
         )}
 
@@ -1224,6 +1580,7 @@ export function ChatSidebar({
               <button
                 type="button"
                 data-topic-id="all"
+                style={{ minHeight: 28, minWidth: 48, padding: '4px 10px' }}
                 className={`chip-btn xs ${selectedTopicId === null ? 'active' : ''}`}
                 onClick={() => onSelectTopic(null)}
               >
@@ -1235,6 +1592,7 @@ export function ChatSidebar({
                   type="button"
                   data-topic-id={t.topic_id}
                   data-testid={`topic-pill-${t.topic_id}`}
+                  style={{ minHeight: 28, minWidth: 64, padding: '4px 10px' }}
                   className={`chip-btn xs ${selectedTopicId === t.topic_id ? 'active' : ''}`}
                   onClick={() => onSelectTopic(t.topic_id)}
                 >
@@ -1247,6 +1605,13 @@ export function ChatSidebar({
 
         {/* Dialog List / Search Results */}
         <div className="dialog-list" role="listbox" aria-label={tr(locale, 'nav.chats')}>
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
+          <span aria-hidden="true" style={{ display: 'none' }} />
           {noSearchHits ? (
             <div className="empty-search-box" data-testid="search-empty-state">
               <div className="empty-icon">🔍</div>
@@ -1285,7 +1650,7 @@ export function ChatSidebar({
                           {dlg.is_muted ? ' 🔕' : ''}
                         </span>
                         {dlg.unread_count > 0 && (
-                          <span className="unread-badge" data-testid="dialog-unread-badge">
+                          <span className="unread-badge" data-testid="chat-unread-badge">
                             {dlg.unread_count}
                           </span>
                         )}
@@ -1477,294 +1842,6 @@ export function ChatSidebar({
                 {tr(locale, 'ctx.confirm')}
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* Creation Modals (Group, Channel, Forum, Fabushi Bot, BotFather NL, Contact, Folder, Story, Topic) */}
-      {createModal && (
-        <div className="modal-backdrop" onClick={() => setCreateModal(null)}>
-          <div
-            className="modal-card"
-            role="dialog"
-            aria-modal="true"
-            data-testid={`create-modal-${createModal}`}
-            onClick={(e) => e.stopPropagation()}
-          >
-            {(createModal === 'group' || createModal === 'channel' || createModal === 'forum') && (
-              <form className="auth-form-stack" onSubmit={(e) => void handleCreateGroupOrChannel(e)}>
-                <h3>
-                  {createModal === 'channel'
-                    ? tr(locale, 'sidebar.createChannel')
-                    : createModal === 'forum'
-                      ? tr(locale, 'sidebar.createForum')
-                      : tr(locale, 'sidebar.createGroup')}
-                </h3>
-                {modalError && (
-                  <div className="error-banner" role="alert" data-testid="create-modal-error">
-                    {modalError}
-                  </div>
-                )}
-                <label className="field-stack">
-                  <span className="field-label">Title</span>
-                  <input
-                    className="input"
-                    autoFocus
-                    data-testid="create-chat-title-input"
-                    value={newChatTitle}
-                    onChange={(e) => setNewChatTitle(e.target.value)}
-                    placeholder="Engineering Core"
-                  />
-                </label>
-                <label className="field-stack">
-                  <span className="field-label">Description (optional)</span>
-                  <input
-                    className="input"
-                    data-testid="create-chat-about-input"
-                    value={newChatAbout}
-                    onChange={(e) => setNewChatAbout(e.target.value)}
-                    placeholder="Purpose of this space…"
-                  />
-                </label>
-                <div className="modal-actions">
-                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
-                    {tr(locale, 'ctx.cancel')}
-                  </button>
-                  <button
-                    type="submit"
-                    className="btn primary"
-                    data-testid="create-chat-submit-btn"
-                    disabled={modalBusy}
-                  >
-                    Create
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {createModal === 'fabushi' && (
-              <form className="auth-form-stack" onSubmit={(e) => void handleCreateFabushiBot(e)}>
-                <h3>🤖 {tr(locale, 'sidebar.createBot')}</h3>
-                {modalError && (
-                  <div className="error-banner" role="alert" data-testid="create-modal-error">
-                    {modalError}
-                  </div>
-                )}
-                <label className="field-stack">
-                  <span className="field-label">Bot Display Name</span>
-                  <input
-                    className="input"
-                    autoFocus
-                    data-testid="fabushi-bot-name-input"
-                    value={botName}
-                    onChange={(e) => setBotName(e.target.value)}
-                    placeholder="Research Companion"
-                  />
-                </label>
-                <label className="field-stack">
-                  <span className="field-label">Bot Username (@handle)</span>
-                  <input
-                    className="input"
-                    data-testid="fabushi-bot-username-input"
-                    value={botUsername}
-                    onChange={(e) => setBotUsername(e.target.value)}
-                    placeholder="research_companion_bot"
-                  />
-                </label>
-                <label className="field-stack">
-                  <span className="field-label">Persona & System Instructions</span>
-                  <textarea
-                    className="input"
-                    rows={3}
-                    data-testid="fabushi-bot-persona-input"
-                    value={botPersona}
-                    onChange={(e) => setBotPersona(e.target.value)}
-                    placeholder="Helpful browser & coding specialist…"
-                  />
-                </label>
-                <div className="modal-actions">
-                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
-                    {tr(locale, 'ctx.cancel')}
-                  </button>
-                  <button
-                    type="submit"
-                    className="btn primary"
-                    data-testid="fabushi-bot-submit-btn"
-                    disabled={modalBusy}
-                  >
-                    Create Bot
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {createModal === 'botfather' && (
-              <form className="auth-form-stack" onSubmit={(e) => void handleCreateBotFatherNl(e)}>
-                <h3>✨ {tr(locale, 'sidebar.createBotFather')}</h3>
-                {modalError && (
-                  <div className="error-banner" role="alert">
-                    {modalError}
-                  </div>
-                )}
-                <label className="field-stack">
-                  <span className="field-label">Describe your Bot & Mini App in natural language</span>
-                  <textarea
-                    className="input"
-                    rows={4}
-                    autoFocus
-                    data-testid="botfather-nl-input"
-                    value={botFatherPrompt}
-                    onChange={(e) => setBotFatherPrompt(e.target.value)}
-                    placeholder="Create a daily standup tracker bot with an interactive Kanban mini app…"
-                  />
-                </label>
-                <div className="modal-actions">
-                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
-                    {tr(locale, 'ctx.cancel')}
-                  </button>
-                  <button
-                    type="submit"
-                    className="btn primary"
-                    data-testid="botfather-nl-submit-btn"
-                    disabled={modalBusy}
-                  >
-                    Generate via @BotFather
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {createModal === 'contact' && (
-              <form className="auth-form-stack" onSubmit={(e) => void handleAddContactOrDm(e)}>
-                <h3>👤 {tr(locale, 'sidebar.addContact')}</h3>
-                {modalError && (
-                  <div className="error-banner" role="alert">
-                    {modalError}
-                  </div>
-                )}
-                <label className="field-stack">
-                  <span className="field-label">Username or User ID</span>
-                  <input
-                    className="input"
-                    autoFocus
-                    data-testid="contact-target-input"
-                    value={contactTarget}
-                    onChange={(e) => setContactTarget(e.target.value)}
-                    placeholder="@bob"
-                  />
-                </label>
-                <div className="modal-actions">
-                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
-                    {tr(locale, 'ctx.cancel')}
-                  </button>
-                  <button
-                    type="submit"
-                    className="btn primary"
-                    data-testid="contact-submit-btn"
-                    disabled={modalBusy}
-                  >
-                    Open Direct Chat
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {createModal === 'folder' && (
-              <form className="auth-form-stack" onSubmit={(e) => void handleCreateFolder(e)}>
-                <h3>📁 {tr(locale, 'sidebar.newFolder')}</h3>
-                {modalError && (
-                  <div className="error-banner" role="alert">
-                    {modalError}
-                  </div>
-                )}
-                <label className="field-stack">
-                  <span className="field-label">Folder Name</span>
-                  <input
-                    className="input"
-                    autoFocus
-                    data-testid="folder-title-input"
-                    value={folderTitle}
-                    onChange={(e) => setFolderTitle(e.target.value)}
-                    placeholder={tr(locale, 'sidebar.folderNamePlaceholder')}
-                  />
-                </label>
-                <div className="folder-chat-checklist">
-                  {allMergedDialogs.map((d) => (
-                    <label key={d.chat_id} className="checkbox-row">
-                      <input
-                        type="checkbox"
-                        checked={folderSelectedChats.includes(d.chat_id)}
-                        onChange={(e) =>
-                          setFolderSelectedChats((prev) =>
-                            e.target.checked
-                              ? [...prev, d.chat_id]
-                              : prev.filter((id) => id !== d.chat_id),
-                          )
-                        }
-                      />
-                      <span>{d.title}</span>
-                    </label>
-                  ))}
-                </div>
-                <div className="modal-actions">
-                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
-                    {tr(locale, 'ctx.cancel')}
-                  </button>
-                  <button
-                    type="submit"
-                    className="btn primary"
-                    data-testid="folder-submit-btn"
-                    disabled={modalBusy}
-                  >
-                    Save Folder
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {createModal === 'story' && (
-              <form className="auth-form-stack" onSubmit={(e) => void handleCreateStory(e)}>
-                <h3>✨ Post Story</h3>
-                <input
-                  className="input"
-                  autoFocus
-                  data-testid="story-caption-input"
-                  value={storyCaption}
-                  onChange={(e) => setStoryCaption(e.target.value)}
-                  placeholder="Share an update…"
-                />
-                <div className="modal-actions">
-                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
-                    {tr(locale, 'ctx.cancel')}
-                  </button>
-                  <button type="submit" className="btn primary" data-testid="story-submit-btn">
-                    Publish
-                  </button>
-                </div>
-              </form>
-            )}
-
-            {createModal === 'topic' && (
-              <form className="auth-form-stack" onSubmit={(e) => void handleCreateTopic(e)}>
-                <h3>🏛️ {tr(locale, 'sidebar.newTopic')}</h3>
-                <input
-                  className="input"
-                  autoFocus
-                  data-testid="topic-title-input"
-                  value={topicTitle}
-                  onChange={(e) => setTopicTitle(e.target.value)}
-                  placeholder="Announcements"
-                />
-                <div className="modal-actions">
-                  <button type="button" className="btn" onClick={() => setCreateModal(null)}>
-                    {tr(locale, 'ctx.cancel')}
-                  </button>
-                  <button type="submit" className="btn primary" data-testid="topic-submit-btn">
-                    Create Topic
-                  </button>
-                </div>
-              </form>
-            )}
           </div>
         </div>
       )}

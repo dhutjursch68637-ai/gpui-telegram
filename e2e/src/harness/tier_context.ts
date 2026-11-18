@@ -517,6 +517,15 @@ export async function bootSharedTierContext(
       await browser.closeExtraTabs().catch(() => undefined);
       mockLlm.reset();
       fixtureApp.resetState();
+      await browser.cdp
+        .send('Storage.clearDataForOrigin', { origin: fixtureApp.baseUrl, storageTypes: 'all' })
+        .catch(() => undefined);
+      await browser.cdp
+        .send('Storage.clearDataForOrigin', {
+          origin: fixtureApp.localhostBaseUrl,
+          storageTypes: 'all',
+        })
+        .catch(() => undefined);
 
       await server
         .configureMockLlmProvider(primaryUser.token, mockLlm.port, 'gpt-4o')

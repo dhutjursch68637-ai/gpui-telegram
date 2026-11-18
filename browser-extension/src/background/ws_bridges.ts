@@ -38,17 +38,20 @@ class SingleOutboundBridgeClient {
   private readonly controller: BrowserController;
   private readonly policy: BrowserPolicyEngine;
   private readonly onStateChange: () => void;
+  private readonly getDesktopConnected: () => boolean;
 
   constructor(
     label: 'server' | 'desktop',
     controller: BrowserController,
     policy: BrowserPolicyEngine,
     onStateChange: () => void,
+    getDesktopConnected: () => boolean,
   ) {
     this.label = label;
     this.controller = controller;
     this.policy = policy;
     this.onStateChange = onStateChange;
+    this.getDesktopConnected = getDesktopConnected;
   }
 
   public isConnected(): boolean {
@@ -156,6 +159,7 @@ class SingleOutboundBridgeClient {
           capabilities: CAPABILITIES,
           run_policy: this.policy.getRunPolicy(),
           tabs_summary: tabs,
+          desktop_bridge_connected: this.label === 'desktop' ? true : this.getDesktopConnected(),
         },
       };
 
@@ -238,6 +242,7 @@ class SingleOutboundBridgeClient {
       params: {
         tabs,
         run_policy: this.policy.getRunPolicy(),
+        desktop_bridge_connected: this.label === 'desktop' ? true : this.getDesktopConnected(),
       },
     });
   }
@@ -296,6 +301,7 @@ class SingleOutboundBridgeClient {
     if (method === 'bridge.emergency_stop') {
       await this.policy.triggerEmergencyStop(
         String(params.reason ?? `Emergency stop received over ${this.label} bridge`),
+        { fromRemoteBridge: true },
       );
       return;
     }
@@ -315,11 +321,23 @@ class SingleOutboundBridgeClient {
           ? (params.arguments as Record<string, unknown>)
           : {};
       const caller = params.caller && typeof params.caller === 'object' ? params.caller : {};
+      const botUserId =
+        typeof caller.bot_user_id === 'number'
+          ? caller.bot_user_id
+          : typeof caller.bot_id === 'number'
+            ? caller.bot_id
+            : undefined;
+      const botUsername =
+        typeof caller.bot_username === 'string'
+          ? caller.bot_username
+          : typeof caller.bot_name === 'string'
+            ? caller.bot_name
+            : undefined;
 
       try {
         const result = await this.controller.invokeTool(toolName, toolArgs, {
-          botUserId: typeof caller.bot_user_id === 'number' ? caller.bot_user_id : undefined,
-          botUsername: typeof caller.bot_username === 'string' ? caller.bot_username : undefined,
+          botUserId,
+          botUsername,
           chatId: typeof caller.chat_id === 'number' ? caller.chat_id : null,
           preApprovedByCaller: Boolean(params.approved ?? caller.approved),
           timeoutMs: typeof params.timeout_ms === 'number' ? params.timeout_ms : undefined,
@@ -399,26 +417,34 @@ export class DualBridgeManager {
       controller,
       policy,
       onStateChange,
+      () => this.desktopBridge.isConnected(),
     );
     this.desktopBridge = new SingleOutboundBridgeClient(
       'desktop',
       controller,
       policy,
-      onStateChange,
+      () => {
+        onStateChange();
+        // Propagate desktop_bridge_connected transition immediately to serverRelay
+        void this.syncTabsImmediate();
+      },
+      () => true,
     );
 
-    this.policy.onEmergencyStop(async (reason) => {
-      const payload = {
-        jsonrpc: '2.0',
-        method: 'bridge.emergency_stop',
-        params: {
-          reason,
-          triggered_by: 'extension_killswitch',
-          timestamp_ms: Date.now(),
-        },
-      };
-      this.serverRelay.sendJson(payload);
-      this.desktopBridge.sendJson(payload);
+    this.policy.onEmergencyStop(async (reason, meta) => {
+      if (!meta?.fromRemoteBridge) {
+        const payload = {
+          jsonrpc: '2.0',
+          method: 'bridge.emergency_stop',
+          params: {
+            reason,
+            triggered_by: 'extension_killswitch',
+            timestamp_ms: Date.now(),
+          },
+        };
+        this.serverRelay.sendJson(payload);
+        this.desktopBridge.sendJson(payload);
+      }
       await this.syncTabsImmediate();
     });
   }

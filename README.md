@@ -84,5 +84,6 @@ Load in Chrome / Chromium:
 ```bash
 npm --prefix e2e install
 ./e2e/run_e2e.sh --check-harness
-./e2e/run_e2e.sh --all
+./e2e/run_e2e.sh --tier 1   # or --tier 2, --tier 3, --tier 4
+./e2e/run_e2e.sh            # run all 218 tests across Tiers 1–4
 ```

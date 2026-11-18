@@ -634,6 +634,14 @@ fn percent_encode(input: &str) -> String {
 
 async fn execute_browser_tool(
     raw_name: &str,
+    args: Value,
+    ctx: &HermesToolContext,
+) -> HermesToolResult {
+    Box::pin(execute_browser_tool_inner(raw_name, args, ctx)).await
+}
+
+async fn execute_browser_tool_inner(
+    raw_name: &str,
     mut args: Value,
     ctx: &HermesToolContext,
 ) -> HermesToolResult {

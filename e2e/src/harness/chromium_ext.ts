@@ -1220,6 +1220,27 @@ export async function spawnChromiumWithExtension(
       flatten: true,
     });
     await cdp.send('Runtime.enable', {}, attached.sessionId);
+    await pollUntil(
+      async () => {
+        const probe = await cdp
+          .send<{ result?: { value?: boolean } }>(
+            'Runtime.evaluate',
+            {
+              expression:
+                "Boolean(typeof chrome !== 'undefined' && chrome?.storage?.local && chrome?.runtime?.id)",
+              returnByValue: true,
+            },
+            attached.sessionId,
+          )
+          .catch(() => null);
+        return probe?.result?.value === true ? true : null;
+      },
+      {
+        timeoutMs: 3000,
+        intervalMs: 40,
+        message: 'MV3 Service Worker chrome.storage.local initialization',
+      },
+    ).catch(() => undefined);
     extensionId = extId;
     swTargetId = swTarget.targetId;
     swSessionId = attached.sessionId;

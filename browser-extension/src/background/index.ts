@@ -265,6 +265,10 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     });
   }
 
+  if (changes.accounts || changes.active_account_id) {
+    void emitStateSnapshot();
+  }
+
   if (storageDebounceTimer) {
     clearTimeout(storageDebounceTimer);
   }
@@ -276,6 +280,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
         changes.browser_bridge ||
         changes.pairing_token ||
         changes.desktop_bridge_port ||
+        changes.accounts ||
         changes.active_account_id ||
         changes.token ||
         changes.auth_token ||

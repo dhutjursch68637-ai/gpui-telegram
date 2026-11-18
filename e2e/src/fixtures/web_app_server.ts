@@ -89,7 +89,7 @@ function sendJson(
   res.end(JSON.stringify(payload));
 }
 
-function renderShopHtml(): string {
+function renderShopHtml(epoch = 0): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -164,6 +164,7 @@ function renderShopHtml(): string {
 
   <script>
     (function () {
+      const CART_KEY = 'fabushi_cart_${epoch}';
       const searchInput = document.getElementById('shop-search-input');
       const searchBtn = document.getElementById('shop-search-btn');
       const catSelect = document.getElementById('shop-category-select');
@@ -174,7 +175,7 @@ function renderShopHtml(): string {
 
       let cart = [];
       try {
-        cart = JSON.parse(localStorage.getItem('fabushi_cart') || '[]');
+        cart = JSON.parse(localStorage.getItem(CART_KEY) || '[]');
       } catch {
         cart = [];
       }
@@ -211,7 +212,7 @@ function renderShopHtml(): string {
           const size = sizeSelect.value || 'M';
           cart.push({ sku, size, qty: 1 });
           try {
-            localStorage.setItem('fabushi_cart', JSON.stringify(cart));
+            localStorage.setItem(CART_KEY, JSON.stringify(cart));
           } catch {}
           renderCartBadge();
           fetch('/api/shop/cart', {
@@ -227,7 +228,7 @@ function renderShopHtml(): string {
 </html>`;
 }
 
-function renderCheckoutHtml(): string {
+function renderCheckoutHtml(epoch = 0): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -353,7 +354,7 @@ function renderCheckoutHtml(): string {
 
         let items = [];
         try {
-          items = JSON.parse(localStorage.getItem('fabushi_cart') || '[]');
+          items = JSON.parse(localStorage.getItem('fabushi_cart_${epoch}') || '[]');
         } catch {}
 
         const resp = await fetch('/api/shop/order', {
@@ -544,6 +545,7 @@ export async function startFixtureWebAppServer(
   explicitPort?: number,
 ): Promise<FixtureWebAppHandle> {
   const port = explicitPort ?? (await findFreeDualStackPort());
+  let resetEpoch = 0;
   const cartItems: Array<{ sku: string; size: string; qty: number }> = [];
   const submittedOrders: ShopOrderRecord[] = [];
   const metricsRequests: Array<{ url: string; timestampMs: number }> = [];
@@ -585,7 +587,7 @@ export async function startFixtureWebAppServer(
     }
 
     if (pathname === '/shop' && req.method === 'GET') {
-      sendHtml(res, renderShopHtml());
+      sendHtml(res, renderShopHtml(resetEpoch));
       return;
     }
 
@@ -601,7 +603,7 @@ export async function startFixtureWebAppServer(
     }
 
     if (pathname === '/shop/checkout' && req.method === 'GET') {
-      sendHtml(res, renderCheckoutHtml());
+      sendHtml(res, renderCheckoutHtml(resetEpoch));
       return;
     }
 
@@ -968,6 +970,7 @@ export async function startFixtureWebAppServer(
     metricsRequests,
     recordedRequests,
     resetState(): void {
+      resetEpoch += 1;
       cartItems.length = 0;
       submittedOrders.length = 0;
       metricsRequests.length = 0;

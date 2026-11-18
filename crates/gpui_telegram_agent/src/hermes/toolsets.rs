@@ -2474,6 +2474,14 @@ impl HermesToolExecutor {
         args: Value,
         ctx: &HermesToolContext,
     ) -> HermesToolResult {
+        Box::pin(Self::execute_inner(spec_name, args, ctx)).await
+    }
+
+    async fn execute_inner(
+        spec_name: &str,
+        args: Value,
+        ctx: &HermesToolContext,
+    ) -> HermesToolResult {
         let start = Instant::now();
 
         if ctx.is_cancelled() {

@@ -2578,6 +2578,9 @@ pub fn ensure_companion_bot_dm_with_welcome(
     let (chat_id, created_chat) = state
         .db
         .ensure_companion_bot_chat_record(user_id, bot_user_id)?;
+    let _ = state
+        .db
+        .mark_user_started_bot_chat(user_id.0 as i64, bot_user_id.0 as i64);
 
     state.gateway_hub.subscribe_chat(chat_id.0, user_id);
     state.gateway_hub.subscribe_chat(chat_id.0, bot_user_id);

@@ -75,8 +75,11 @@ async function clickMenuItemMatching(
         const hit = items.find((el) => {
           const r = el.getBoundingClientRect();
           if (r.width <= 0 || r.height <= 0 || r.height > 68) return false;
-          const txt = `${el.getAttribute('data-testid') ?? ''} ${el.getAttribute('aria-label') ?? ''} ${el.textContent ?? ''}`;
-          return re.test(txt);
+          const testId = (el.getAttribute('data-testid') ?? '').trim();
+          const aria = (el.getAttribute('aria-label') ?? '').trim();
+          const text = (el.textContent ?? '').trim();
+          const combined = `${testId} ${aria} ${text}`.trim();
+          return re.test(text) || re.test(aria) || re.test(testId) || re.test(combined);
         });
         if (!hit) return null;
         const r = hit.getBoundingClientRect();

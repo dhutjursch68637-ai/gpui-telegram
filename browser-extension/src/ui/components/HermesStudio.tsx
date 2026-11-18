@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   CANONICAL_BROWSER_TOOLS,
   CANONICAL_TEST_IDS,
@@ -56,17 +56,22 @@ export function HermesStudio({
   const [boards, setBoards] = useState<Array<Record<string, any>>>([]);
   const [cards, setCards] = useState<Array<Record<string, any>>>([]);
   const [newCardTitle, setNewCardTitle] = useState('');
+  const kanbanInputRef = useRef<HTMLInputElement | null>(null);
 
   // 2. Skills state
   const [skills, setSkills] = useState<Array<Record<string, any>>>([]);
   const [skillName, setSkillName] = useState('');
   const [skillContent, setSkillContent] = useState('');
+  const skillNameRef = useRef<HTMLInputElement | null>(null);
+  const skillContentRef = useRef<HTMLTextAreaElement | null>(null);
 
   // 3. Memory & Soul state
   const [memoryText, setMemoryText] = useState('');
   const [soulText, setSoulText] = useState('');
   const [memoryStatus, setMemoryStatus] = useState('');
   const [memoryError, setMemoryError] = useState('');
+  const memoryTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const soulTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   // 4. MCP & Toolsets state
   const [toolsets, setToolsets] = useState<Record<string, any>>({});
@@ -78,11 +83,15 @@ export function HermesStudio({
   const [cronSchedule, setCronSchedule] = useState('*/15 * * * *');
   const [cronPrompt, setCronPrompt] = useState('');
   const [cronError, setCronError] = useState('');
+  const cronNameRef = useRef<HTMLInputElement | null>(null);
+  const cronScheduleRef = useRef<HTMLInputElement | null>(null);
+  const cronPromptRef = useRef<HTMLInputElement | null>(null);
 
   // 6. Sessions state
   const [sessions, setSessions] = useState<Array<Record<string, any>>>([]);
   const [sessionSearch, setSessionSearch] = useState('');
   const [selectedSessionEvents, setSelectedSessionEvents] = useState<string>('');
+  const sessionSearchRef = useRef<HTMLInputElement | null>(null);
 
   // 7. Server Hermes approvals
   const [hermesApprovals, setHermesApprovals] = useState<Array<Record<string, any>>>([]);
@@ -130,14 +139,17 @@ export function HermesStudio({
       if (mRes.ok) {
         setMemoryText(
           String(
-            mRes.data?.content ??
+            mRes.data?.memory_markdown ??
+              mRes.data?.content ??
               mRes.data?.memory ??
               (Array.isArray(mRes.data?.entries) ? mRes.data.entries.join('\n') : ''),
           ),
         );
       }
       if (slRes.ok) {
-        setSoulText(String(slRes.data?.content ?? slRes.data?.soul ?? ''));
+        setSoulText(
+          String(slRes.data?.soul_markdown ?? slRes.data?.content ?? slRes.data?.soul ?? ''),
+        );
       }
     } else if (tab === 'mcp') {
       const tRes = await apiRequest<any>('/api/v1/hermes/toolsets');
@@ -186,7 +198,8 @@ export function HermesStudio({
 
   const handleAddKanbanCard = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newCardTitle.trim()) return;
+    const cardTitleVal = (kanbanInputRef.current?.value ?? newCardTitle).trim();
+    if (!cardTitleVal) return;
     let boardId = boards[0]?.board_id ?? boards[0]?.id;
     if (!boardId) {
       const createdBoard = await apiRequest<any>('/api/v1/hermes/kanban/boards', {
@@ -199,12 +212,13 @@ export function HermesStudio({
       method: 'POST',
       body: {
         board_id: boardId,
-        title: newCardTitle.trim(),
+        title: cardTitleVal,
         column: 'todo',
         status: 'todo',
       },
     });
     setNewCardTitle('');
+    if (kanbanInputRef.current) kanbanInputRef.current.value = '';
     await refreshActiveTab();
   };
 
@@ -218,30 +232,36 @@ export function HermesStudio({
 
   const handleCreateSkill = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!skillName.trim()) return;
+    const nameVal = (skillNameRef.current?.value ?? skillName).trim();
+    const contentVal = (skillContentRef.current?.value ?? skillContent).trim();
+    if (!nameVal) return;
     await apiRequest('/api/v1/hermes/skills', {
       method: 'POST',
       body: {
-        name: skillName.trim(),
-        description: `Procedural skill ${skillName.trim()}`,
-        content: skillContent.trim() || `# ${skillName.trim()}\nFollow user instructions carefully.`,
+        name: nameVal,
+        description: `Procedural skill ${nameVal}`,
+        content: contentVal || `# ${nameVal}\nFollow user instructions carefully.`,
       },
     });
     setSkillName('');
     setSkillContent('');
+    if (skillNameRef.current) skillNameRef.current.value = '';
+    if (skillContentRef.current) skillContentRef.current.value = '';
     await refreshActiveTab();
   };
 
   const handleSaveMemory = async () => {
     setMemoryError('');
     setMemoryStatus('');
-    if (memoryText.length > 65536) {
+    const val = memoryTextareaRef.current?.value ?? memoryText;
+    if (val.length > 65536) {
       setMemoryError('MEMORY.md exceeds maximum 64 KB limit. Please compact entries first.');
       return;
     }
+    setMemoryText(val);
     const res = await apiRequest('/api/v1/hermes/memory', {
       method: 'PUT',
-      body: { content: memoryText, memory: memoryText },
+      body: { memory_markdown: val, content: val, memory: val },
     });
     if (!res.ok) {
       setMemoryError(res.error || 'Failed to save MEMORY.md');
@@ -253,13 +273,15 @@ export function HermesStudio({
   const handleSaveSoul = async () => {
     setMemoryError('');
     setMemoryStatus('');
-    if (soulText.length > 65536) {
+    const val = soulTextareaRef.current?.value ?? soulText;
+    if (val.length > 65536) {
       setMemoryError('SOUL.md exceeds maximum 64 KB limit.');
       return;
     }
+    setSoulText(val);
     const res = await apiRequest('/api/v1/hermes/soul', {
       method: 'PUT',
-      body: { content: soulText, soul: soulText },
+      body: { soul_markdown: val, content: val, soul: val },
     });
     if (!res.ok) {
       setMemoryError(res.error || 'Failed to save SOUL.md');
@@ -271,23 +293,26 @@ export function HermesStudio({
   const handleCreateCron = async (e: React.FormEvent) => {
     e.preventDefault();
     setCronError('');
-    if (!isValidCronExpression(cronSchedule)) {
+    const schedVal = cronScheduleRef.current?.value ?? cronSchedule;
+    const nameVal = (cronNameRef.current?.value ?? cronName).trim();
+    const promptVal = (cronPromptRef.current?.value ?? cronPrompt).trim();
+    if (!isValidCronExpression(schedVal)) {
       setCronError(
-        `Invalid cron schedule "${cronSchedule}". Expected 5-field cron syntax (e.g. "*/15 * * * *") or @hourly/@daily.`,
+        `Invalid cron schedule "${schedVal}". Expected 5-field cron syntax (e.g. "*/15 * * * *") or @hourly/@daily.`,
       );
       return;
     }
-    if (!cronName.trim() && !cronPrompt.trim()) {
+    if (!nameVal && !promptVal) {
       setCronError('Job name or prompt is required.');
       return;
     }
     const res = await apiRequest('/api/v1/hermes/cron', {
       method: 'POST',
       body: {
-        name: cronName.trim() || 'Scheduled Agent Routine',
-        schedule: cronSchedule.trim(),
-        cron_expr: cronSchedule.trim(),
-        prompt: cronPrompt.trim() || 'Check daily updates',
+        name: nameVal || 'Scheduled Agent Routine',
+        schedule: schedVal.trim(),
+        cron_expr: schedVal.trim(),
+        prompt: promptVal || 'Check daily updates',
         enabled: true,
       },
     });
@@ -297,18 +322,21 @@ export function HermesStudio({
     }
     setCronName('');
     setCronPrompt('');
+    if (cronNameRef.current) cronNameRef.current.value = '';
+    if (cronPromptRef.current) cronPromptRef.current.value = '';
     await refreshActiveTab();
   };
 
   const handleSearchSessions = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!sessionSearch.trim()) {
+    const qVal = (sessionSearchRef.current?.value ?? sessionSearch).trim();
+    if (!qVal) {
       await refreshActiveTab();
       return;
     }
     const res = await apiRequest<any>('/api/v1/hermes/sessions/search', {
       method: 'POST',
-      body: { query: sessionSearch.trim(), q: sessionSearch.trim() },
+      body: { query: qVal, q: qVal },
     });
     if (res.ok) {
       setSessions(
@@ -374,6 +402,7 @@ export function HermesStudio({
           <div className="studio-section" data-testid="studio-panel-tasks">
             <form className="row-gap-8" onSubmit={(e) => void handleAddKanbanCard(e)}>
               <input
+                ref={kanbanInputRef}
                 className="input flex-1"
                 data-testid="kanban-card-title-input"
                 value={newCardTitle}
@@ -437,6 +466,7 @@ export function HermesStudio({
             <form className="card-sub-box auth-form-stack" onSubmit={(e) => void handleCreateSkill(e)}>
               <strong>Create Procedural SKILL.md</strong>
               <input
+                ref={skillNameRef}
                 className="input"
                 data-testid="studio-skill-name-input"
                 value={skillName}
@@ -444,6 +474,7 @@ export function HermesStudio({
                 placeholder="web-research-workflow"
               />
               <textarea
+                ref={skillContentRef}
                 className="input"
                 rows={3}
                 data-testid="studio-skill-content-input"
@@ -513,6 +544,7 @@ export function HermesStudio({
               <div className="card-sub-box auth-form-stack">
                 <strong>🧠 Persistent Memory (MEMORY.md)</strong>
                 <textarea
+                  ref={memoryTextareaRef}
                   className="input mono"
                   rows={8}
                   data-testid="studio-memory-textarea"
@@ -533,6 +565,7 @@ export function HermesStudio({
               <div className="card-sub-box auth-form-stack">
                 <strong>✨ Persona Instructions (SOUL.md)</strong>
                 <textarea
+                  ref={soulTextareaRef}
                   className="input mono"
                   rows={8}
                   data-testid="studio-soul-textarea"
@@ -612,6 +645,7 @@ export function HermesStudio({
               <strong>⏰ Schedule Autonomous Cron Routine</strong>
               <div className="row-gap-8">
                 <input
+                  ref={cronNameRef}
                   className="input flex-1"
                   data-testid="studio-cron-name-input"
                   value={cronName}
@@ -619,6 +653,7 @@ export function HermesStudio({
                   placeholder="Morning Briefing"
                 />
                 <input
+                  ref={cronScheduleRef}
                   className="input mono"
                   data-testid="studio-cron-schedule-input"
                   value={cronSchedule}
@@ -627,6 +662,7 @@ export function HermesStudio({
                 />
               </div>
               <input
+                ref={cronPromptRef}
                 className="input"
                 data-testid="studio-cron-prompt-input"
                 value={cronPrompt}
@@ -683,6 +719,7 @@ export function HermesStudio({
           <div className="studio-section" data-testid="studio-panel-sessions">
             <form className="row-gap-8" onSubmit={(e) => void handleSearchSessions(e)}>
               <input
+                ref={sessionSearchRef}
                 className="input flex-1"
                 data-testid="studio-session-search-input"
                 value={sessionSearch}

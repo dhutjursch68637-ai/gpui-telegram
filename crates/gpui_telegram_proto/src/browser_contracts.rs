@@ -2233,6 +2233,8 @@ pub struct BridgeHelloParams {
     pub capabilities: Vec<String>,
     pub run_policy: BrowserRunPolicy,
     pub tabs_summary: Vec<BrowserTabDto>,
+    #[serde(default)]
+    pub desktop_bridge_connected: bool,
 }
 
 impl Default for BridgeHelloParams {
@@ -2246,6 +2248,7 @@ impl Default for BridgeHelloParams {
             capabilities: Vec::new(),
             run_policy: BrowserRunPolicy::AskEveryTime,
             tabs_summary: Vec::new(),
+            desktop_bridge_connected: false,
         }
     }
 }
@@ -2279,6 +2282,8 @@ impl Default for BridgeHelloAckParams {
 pub struct BridgeTabsSyncParams {
     pub tabs: Vec<BrowserTabDto>,
     pub run_policy: BrowserRunPolicy,
+    #[serde(default)]
+    pub desktop_bridge_connected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2290,6 +2295,8 @@ pub struct BrowserInvokeParams {
     pub caller: BrowserCallerInfo,
     #[serde(default = "default_invoke_timeout_ms")]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub approved: bool,
 }
 
 impl Default for BrowserInvokeParams {
@@ -2299,6 +2306,7 @@ impl Default for BrowserInvokeParams {
             arguments: default_empty_object(),
             caller: BrowserCallerInfo::default(),
             timeout_ms: DEFAULT_BROWSER_INVOKE_TIMEOUT_MS,
+            approved: false,
         }
     }
 }
@@ -3016,6 +3024,7 @@ mod tests {
         let sync_frame = BrowserBridgeFrame::tabs_sync(BridgeTabsSyncParams {
             tabs: vec![BrowserTabDto::default()],
             run_policy: BrowserRunPolicy::AllowReadOnly,
+            desktop_bridge_connected: false,
         });
         assert_eq!(
             BrowserBridgeFrame::parse_json(&sync_frame.to_json_string().unwrap()).unwrap(),
@@ -3035,6 +3044,7 @@ mod tests {
                     chat_id: Some(700_000_001),
                 },
                 timeout_ms: 20_000,
+                approved: false,
             },
         );
         let invoke_json = invoke.to_json_string().unwrap();

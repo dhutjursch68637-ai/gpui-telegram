@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import type { ExtensionLocale } from '../../shared/rpc_types';
 import { tr } from '../i18n/translations';
 import { sendSwRpc } from '../sw_client';
@@ -43,22 +43,26 @@ export function PasscodeLockScreen({
   const [attempts, setAttempts] = useState(0);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!pin.trim() || busy) return;
+    const candidate = (inputRef.current?.value ?? pin).trim();
+    if (!candidate || busy) return;
     setBusy(true);
-    const ok = await verifyStoredPasscode(pin.trim());
+    const ok = await verifyStoredPasscode(candidate);
     setBusy(false);
     if (ok) {
       setError('');
       setPin('');
+      if (inputRef.current) inputRef.current.value = '';
       await sendSwRpc({ type: 'ui.set_preferences', passcode_locked: false });
       onUnlocked();
     } else {
       const nextAttempts = attempts + 1;
       setAttempts(nextAttempts);
       setPin('');
+      if (inputRef.current) inputRef.current.value = '';
       setError(`${tr(locale, 'lock.wrongPin')} ${nextAttempts}`);
     }
   };
@@ -82,6 +86,7 @@ export function PasscodeLockScreen({
         </p>
 
         <input
+          ref={inputRef}
           type="password"
           inputMode="numeric"
           autoFocus
@@ -103,7 +108,7 @@ export function PasscodeLockScreen({
           type="submit"
           className="btn primary full-width"
           data-testid="passcode-unlock-btn"
-          disabled={busy || !pin.trim()}
+          disabled={busy}
         >
           {tr(locale, 'lock.unlockBtn')}
         </button>
