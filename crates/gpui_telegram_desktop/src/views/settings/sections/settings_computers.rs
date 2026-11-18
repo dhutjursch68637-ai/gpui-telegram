@@ -1,11 +1,13 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::browser_contracts::BrowserRunPolicy;
 use gpui_telegram_proto::{
     AuthorizedControllerEntry, AuthorizedControllerKind, CloudAuthMethod, ComputerNodeDto,
     ComputerNodeKind, ComputerRunPolicy, TailnetNodeStatus, TailnetPeerLiveState, TailnetRelayMode,
     UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
 };
 
+use crate::browser_bridge::{global_desktop_browser_bridge, DesktopBrowserBridgeSnapshot};
 use crate::components::ui::{
     TextInputController, delete_prev_word, pop_last_char, sanitize_paste_text,
 };
@@ -52,6 +54,11 @@ pub enum SettingsComputersEvent {
     TestNode(String),
     OpenRemoteWorkbench(String),
     RefreshComputers,
+    CopyBrowserToken(String),
+    RotateBrowserToken,
+    SetBrowserPolicy(BrowserRunPolicy),
+    LaunchManagedChromium,
+    BrowserEmergencyStop,
 }
 
 pub struct SettingsComputersSections {
@@ -60,6 +67,7 @@ pub struct SettingsComputersSections {
     pub page: SettingsComputersPage,
     pub computers: Vec<ComputerNodeDto>,
     pub tailnet_status: Option<TailnetNodeStatus>,
+    pub browser_bridge: DesktopBrowserBridgeSnapshot,
     pub known_bots: Vec<(u64, String)>,
     pub current_bot_id: Option<u64>,
     pub status_message: Option<String>,
@@ -99,6 +107,7 @@ impl SettingsComputersSections {
             page: SettingsComputersPage::Overview,
             computers: Vec::new(),
             tailnet_status: None,
+            browser_bridge: global_desktop_browser_bridge().snapshot(),
             known_bots: Vec::new(),
             current_bot_id: None,
             status_message: None,
@@ -142,6 +151,10 @@ impl SettingsComputersSections {
 
     pub fn sync_tailnet_status(&mut self, status: Option<TailnetNodeStatus>) {
         self.tailnet_status = status;
+    }
+
+    pub fn sync_browser_bridge(&mut self, snap: DesktopBrowserBridgeSnapshot) {
+        self.browser_bridge = snap;
     }
 
     pub fn sync_known_bots(&mut self, bots: Vec<(u64, String)>, current_bot_id: Option<u64>) {
@@ -856,6 +869,7 @@ impl SettingsComputersSections {
                 )
             })
             .child(self.render_tailnet_mesh_card(pal, lang))
+            .child(self.render_browser_bridge_card(pal, lang, cx))
             .child(settings_subsection_title(
                 tr_str(lang, "本地电脑", "Local Computers"),
                 pal,
@@ -866,6 +880,251 @@ impl SettingsComputersSections {
                 pal,
             ))
             .child(cloud_card)
+            .into_any_element()
+    }
+
+    fn render_browser_bridge_card(
+        &self,
+        pal: TdesktopThemePalette,
+        lang: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let br = &self.browser_bridge;
+        let copy_tok = br.pairing_token.clone();
+
+        let (badge_text, badge_color) = if br.emergency_stopped {
+            (
+                tr_str(lang, "已紧急停用", "Emergency Stopped").to_string(),
+                pal.danger,
+            )
+        } else if br.extension_connected {
+            (
+                format!(
+                    "{} · {} tabs",
+                    tr_str(lang, "Chrome 扩展已配对", "Extension Paired"),
+                    br.active_tabs
+                ),
+                pal.success,
+            )
+        } else if br.local_cdp_available {
+            (
+                tr_str(lang, "托管 Chromium CDP 在线", "Managed Chromium CDP Ready").to_string(),
+                pal.accent,
+            )
+        } else {
+            (
+                tr_str(lang, "等待 Chrome 扩展配对", "Awaiting Extension Pairing").to_string(),
+                pal.text_secondary,
+            )
+        };
+
+        let policies = [
+            (
+                BrowserRunPolicy::AlwaysAllowAuthorized,
+                tr_str(lang, "自动授权", "Always Allow"),
+            ),
+            (
+                BrowserRunPolicy::AllowReadOnly,
+                tr_str(lang, "仅只读", "Read-Only"),
+            ),
+            (
+                BrowserRunPolicy::AskEveryTime,
+                tr_str(lang, "每次询问", "Ask Every Time"),
+            ),
+            (
+                BrowserRunPolicy::Disabled,
+                tr_str(lang, "禁用", "Disabled"),
+            ),
+        ];
+
+        settings_card(pal)
+            .p(px(14.0))
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(tg_icon(IconName::ComputerDesktop, 17.0, pal.accent))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(pal.text_primary))
+                                    .child(tr_str(
+                                        lang,
+                                        "浏览器控制本地回环桥接 (127.0.0.1)",
+                                        "Browser Extension Loopback Bridge (127.0.0.1)",
+                                    )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("settings-browser-bridge-status")
+                            .px(px(9.0))
+                            .py(px(3.0))
+                            .rounded(px(999.0))
+                            .bg(TdesktopThemePalette::rgba_with_alpha(badge_color, 0.14))
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(badge_color))
+                            .child(badge_text),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(pal.text_secondary))
+                    .child(format!(
+                        "Endpoint: {}  |  Pairing Token: {}  |  Config: {}",
+                        br.ws_url,
+                        br.masked_token(),
+                        br.config_path
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.0))
+                    .children(policies.into_iter().map(|(pol, label)| {
+                        let sel = br.run_policy == pol;
+                        div()
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(5.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(if sel { pal.accent } else { pal.input_bg }))
+                            .text_xs()
+                            .font_weight(if sel {
+                                FontWeight::BOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .text_color(rgb(if sel {
+                                pal.active_button_fg
+                            } else {
+                                pal.text_primary
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.browser_bridge.run_policy = pol;
+                                    if pol != BrowserRunPolicy::Disabled {
+                                        this.browser_bridge.emergency_stopped = false;
+                                    }
+                                    this.pending_event =
+                                        Some(SettingsComputersEvent::SetBrowserPolicy(pol));
+                                    cx.notify();
+                                }),
+                            )
+                            .child(label.to_string())
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("settings-copy-browser-token")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(pal.input_bg))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(pal.accent))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.pending_event = Some(
+                                        SettingsComputersEvent::CopyBrowserToken(copy_tok.clone()),
+                                    );
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "复制配对令牌", "Copy Pairing Token")),
+                    )
+                    .child(
+                        div()
+                            .id("settings-rotate-browser-token")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(pal.input_bg))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(pal.text_primary))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_event =
+                                        Some(SettingsComputersEvent::RotateBrowserToken);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "轮换令牌", "Rotate Token")),
+                    )
+                    .child(
+                        div()
+                            .id("settings-launch-chromium-cdp")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(pal.accent))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(pal.active_button_fg))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_event =
+                                        Some(SettingsComputersEvent::LaunchManagedChromium);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "一键启动托管 Chromium", "Launch Managed Chromium")),
+                    )
+                    .child(
+                        div()
+                            .id("settings-browser-emergency-stop")
+                            .cursor_pointer()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(7.0))
+                            .bg(rgb(pal.danger))
+                            .text_xs()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(pal.active_button_fg))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.browser_bridge.emergency_stopped = true;
+                                    this.browser_bridge.run_policy = BrowserRunPolicy::Disabled;
+                                    this.pending_event =
+                                        Some(SettingsComputersEvent::BrowserEmergencyStop);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(tr_str(lang, "紧急停止", "Emergency Stop")),
+                    ),
+            )
             .into_any_element()
     }
 

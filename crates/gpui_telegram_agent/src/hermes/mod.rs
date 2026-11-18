@@ -6,6 +6,8 @@
 //! LLM routing (ChatCompletions, CodexResponses, AnthropicMessages, LocalHermes),
 //! `/moa`, all 61 slash commands, trajectory export/redaction, cron/heartbeat, and ACP.
 
+pub mod browser_bridge;
+pub mod browser_cdp;
 pub mod commands;
 pub mod context;
 pub mod memory;
@@ -206,6 +208,10 @@ pub enum HermesEvent {
         inline_buttons: Vec<HermesInlineButton>,
         #[serde(default)]
         ui_actions: Vec<HermesUiAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<toolsets::HermesToolArtifact>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        artifacts: Vec<toolsets::HermesToolArtifact>,
     },
     ApprovalRequired {
         approval_id: String,
@@ -819,7 +825,7 @@ impl HermesStateBridge for ToolContextBridge {
                         return Ok(json!({ "id": id, "history": history }));
                     }
                     if action == "preview" {
-                        let mut routine = CronRoutine::new(job.id.clone(), job.schedule.clone())
+                        let routine = CronRoutine::new(job.id.clone(), job.schedule.clone())
                             .with_time_zone(job.timezone.clone());
                         let summary = routine.preview_next_7_days(Utc::now());
                         return Ok(json!({
@@ -2726,6 +2732,16 @@ impl CommandHost for EngineCommandHost<'_> {
             }
             *slot
         });
+        if key == "browser" {
+            let reg = self.engine.session_toolset_registry(&self.session_id);
+            if let Ok(mut guard) = reg.write() {
+                if new_val {
+                    guard.enable(ToolsetId::Browser);
+                } else {
+                    guard.disable(ToolsetId::Browser);
+                }
+            }
+        }
         Ok(format!("{key} mode is now {}.", if new_val { "ON" } else { "OFF" }))
     }
 
@@ -2782,6 +2798,7 @@ struct HermesEngineInner {
     talk_coordinator: Arc<Mutex<TalkCoordinator>>,
     computer_broker: Arc<Mutex<ComputerLeaseBroker>>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
+    browser_provider: RwLock<Option<Arc<dyn browser_bridge::BrowserBridgeProvider>>>,
     todos: Arc<Mutex<TodoStore>>,
     agentic_store: Arc<Mutex<LocalAgenticStore>>,
     commands: SlashCommandRegistry,
@@ -2941,6 +2958,7 @@ impl HermesEngine {
             talk_coordinator: Arc::new(Mutex::new(TalkCoordinator::new())),
             computer_broker: Arc::new(Mutex::new(ComputerLeaseBroker::new())),
             computer_provider: RwLock::new(None),
+            browser_provider: RwLock::new(None),
             todos: Arc::new(Mutex::new(TodoStore::new())),
             agentic_store: Arc::new(Mutex::new(LocalAgenticStore::new())),
             commands: SlashCommandRegistry::new(),
@@ -3098,6 +3116,23 @@ impl HermesEngine {
     pub fn computer_provider(&self) -> Option<Arc<dyn ComputerCloudProvider>> {
         self.inner
             .computer_provider
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    pub fn set_browser_provider(
+        &self,
+        provider: Arc<dyn browser_bridge::BrowserBridgeProvider>,
+    ) {
+        if let Ok(mut guard) = self.inner.browser_provider.write() {
+            *guard = Some(provider);
+        }
+    }
+
+    pub fn browser_provider(&self) -> Option<Arc<dyn browser_bridge::BrowserBridgeProvider>> {
+        self.inner
+            .browser_provider
             .read()
             .ok()
             .and_then(|g| g.clone())
@@ -3388,6 +3423,12 @@ impl HermesEngine {
         ctx.talk_coordinator = Arc::clone(&self.inner.talk_coordinator);
         ctx.computer_broker = Arc::clone(&self.inner.computer_broker);
         ctx.computer_provider = self.computer_provider();
+        ctx.browser_provider = self.browser_provider();
+        ctx.browser_cdp_url = self
+            .session_settings(session_id)
+            .config_overrides
+            .get("browser_cdp_url")
+            .cloned();
         ctx.todos = Arc::clone(&self.inner.todos);
         ctx.agentic_store = Arc::clone(&self.inner.agentic_store);
         ctx.caller_depth = caller_depth;
@@ -3415,6 +3456,376 @@ impl HermesEngine {
         };
         let outcome = self.inner.commands.execute_raw(text, &mut host);
         Ok((host.session_id, outcome))
+    }
+
+    pub async fn execute_command_async(
+        &self,
+        session_id: Option<&str>,
+        chat_id: Option<i64>,
+        bot_id: Option<&str>,
+        raw_user_id: Option<&str>,
+        text: &str,
+    ) -> Result<(String, CommandExecutionOutcome)> {
+        if let Some(parsed) = SlashCommandParser::parse(text) {
+            let canonical = self
+                .inner
+                .commands
+                .get(&parsed.command)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| parsed.command.clone());
+            if canonical == "browser" {
+                let sess =
+                    self.resolve_or_create_session(session_id, chat_id, bot_id, "command", None)?;
+                let effective_chat = chat_id.or(sess.chat_id);
+                let effective_bot = bot_id
+                    .map(ToString::to_string)
+                    .or_else(|| sess.bot_id.clone());
+                let outcome = self
+                    .exec_browser_command_async(
+                        &sess.id,
+                        effective_chat,
+                        effective_bot.as_deref(),
+                        raw_user_id,
+                        &parsed,
+                    )
+                    .await;
+                return Ok((sess.id, outcome));
+            }
+        }
+        self.execute_command(session_id, chat_id, bot_id, text)
+    }
+
+    async fn exec_browser_command_async(
+        &self,
+        session_id: &str,
+        chat_id: Option<i64>,
+        bot_id: Option<&str>,
+        raw_user_id: Option<&str>,
+        parsed: &commands::ParsedSlashCommand,
+    ) -> CommandExecutionOutcome {
+        let user_id = parse_numeric_user_id(raw_user_id);
+        let bot_u64 = bot_id.and_then(|s| {
+            s.trim()
+                .trim_start_matches("bot_")
+                .parse::<u64>()
+                .ok()
+        });
+        let ctx = self.build_tool_context_with_user(
+            session_id,
+            chat_id,
+            bot_id,
+            raw_user_id,
+            0,
+            None,
+            0,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let sub = parsed.argv.first().map(|s| s.trim());
+        match sub {
+            None | Some("") | Some("status") => {
+                let status_dto = if let Some(ref provider) = ctx.browser_provider {
+                    match provider.status(user_id, bot_u64).await {
+                        Ok(st) => st,
+                        Err(_) => {
+                            browser_cdp::global_cdp_manager()
+                                .status(ctx.browser_cdp_url.as_deref())
+                                .await
+                        }
+                    }
+                } else {
+                    browser_cdp::global_cdp_manager()
+                        .status(ctx.browser_cdp_url.as_deref())
+                        .await
+                };
+                let toolset_enabled = self
+                    .session_toolset_registry(session_id)
+                    .read()
+                    .map(|r| r.is_toolset_enabled(ToolsetId::Browser))
+                    .unwrap_or(true);
+                let cdp_cfg = ctx
+                    .browser_cdp_url
+                    .clone()
+                    .or_else(|| std::env::var("HERMES_BROWSER_CDP_URL").ok());
+                let msg = format!(
+                    "Browser Control Status (`ToolsetId::Browser`: {})\n- Connected: `{}` (mode: `{}`)\n- Active Tabs: `{}`\n- Run Policy: `{}`\n- Server Relay: `{}` | Desktop Bridge: `{}` | Local CDP: `{}`{}",
+                    if toolset_enabled { "ON" } else { "OFF" },
+                    status_dto.connected,
+                    status_dto.mode,
+                    status_dto.active_tabs,
+                    status_dto.run_policy.as_str(),
+                    status_dto.server_relay_connected,
+                    status_dto.desktop_bridge_connected,
+                    status_dto.local_cdp_available,
+                    cdp_cfg
+                        .as_deref()
+                        .map(|u| format!(" (`{u}`)"))
+                        .unwrap_or_default()
+                );
+                CommandExecutionOutcome::ok("browser", msg)
+            }
+            Some("tabs") | Some("list") => {
+                let tabs_res = if let Some(ref provider) = ctx.browser_provider {
+                    if provider.should_route_via_bridge(user_id, bot_u64) {
+                        provider.list_tabs(user_id, bot_u64).await
+                    } else {
+                        browser_cdp::global_cdp_manager()
+                            .list_tabs(ctx.browser_cdp_url.as_deref())
+                            .await
+                            .map_err(|(_, m)| m)
+                    }
+                } else {
+                    browser_cdp::global_cdp_manager()
+                        .list_tabs(ctx.browser_cdp_url.as_deref())
+                        .await
+                        .map_err(|(_, m)| m)
+                };
+
+                match tabs_res {
+                    Ok(tabs) if tabs.is_empty() => {
+                        CommandExecutionOutcome::ok("browser", "Open browser tabs (0): none.")
+                    }
+                    Ok(tabs) => {
+                        let lines: Vec<String> = tabs
+                            .iter()
+                            .map(|t| {
+                                format!(
+                                    "- `[tab_id={}]`{} **{}** — `{}`",
+                                    t.tab_id,
+                                    if t.active { " *(active)*" } else { "" },
+                                    if t.title.is_empty() { "(untitled)" } else { &t.title },
+                                    t.url
+                                )
+                            })
+                            .collect();
+                        CommandExecutionOutcome::ok(
+                            "browser",
+                            format!("Open browser tabs ({}):\n{}", tabs.len(), lines.join("\n")),
+                        )
+                    }
+                    Err(err) => CommandExecutionOutcome::ok(
+                        "browser",
+                        format!("No live browser session connected ({err}). Connect Extension/Desktop bridge or configure `/browser cdp <url>`."),
+                    ),
+                }
+            }
+            Some("open") | Some("navigate") | Some("goto") => {
+                let Some(raw_url) = parsed.argv.get(1).map(|s| s.trim()).filter(|s| !s.is_empty())
+                else {
+                    return CommandExecutionOutcome::err(
+                        "browser",
+                        format!("Missing URL argument. {}", commands::BROWSER_COMMAND_USAGE),
+                    );
+                };
+                let safe_url = match browser_bridge::validate_navigable_browser_url(raw_url, true) {
+                    Ok(u) => u,
+                    Err((code, msg)) => {
+                        return CommandExecutionOutcome::err(
+                            "browser",
+                            format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                        );
+                    }
+                };
+                let tool_name = if sub == Some("open") {
+                    "browser_open_tab"
+                } else {
+                    "browser_navigate"
+                };
+                let res = HermesToolExecutor::execute(
+                    tool_name,
+                    json!({ "url": safe_url }),
+                    &ctx,
+                )
+                .await;
+                if res.success {
+                    CommandExecutionOutcome::ok("browser", res.output)
+                        .with_mutated(vec!["browser".into()])
+                } else {
+                    CommandExecutionOutcome::err("browser", res.output)
+                }
+            }
+            Some("snapshot") | Some("snap") => {
+                let res = HermesToolExecutor::execute("browser_snapshot", json!({}), &ctx).await;
+                if res.success {
+                    CommandExecutionOutcome::ok("browser", res.output)
+                } else {
+                    CommandExecutionOutcome::err("browser", res.output)
+                }
+            }
+            Some("cdp") => {
+                let Some(raw_cdp) = parsed.argv.get(1).map(|s| s.trim()).filter(|s| !s.is_empty())
+                else {
+                    return CommandExecutionOutcome::err(
+                        "browser",
+                        format!("Missing CDP endpoint URL. {}", commands::BROWSER_COMMAND_USAGE),
+                    );
+                };
+                let Some(normalized) =
+                    browser_cdp::CdpBrowserManager::normalize_cdp_http_base(raw_cdp)
+                else {
+                    return CommandExecutionOutcome::err(
+                        "browser",
+                        format!(
+                            "Invalid CDP endpoint `{raw_cdp}`. Expected `http://host:port` or `ws://host:port/...`."
+                        ),
+                    );
+                };
+                self.update_session_settings(session_id, |s| {
+                    s.browser_attached = true;
+                    s.config_overrides
+                        .insert("browser_cdp_url".to_string(), normalized.clone());
+                });
+                if let Ok(mut reg) = self.session_toolset_registry(session_id).write() {
+                    reg.enable(ToolsetId::Browser);
+                }
+                let st = browser_cdp::global_cdp_manager()
+                    .status(Some(&normalized))
+                    .await;
+                CommandExecutionOutcome::ok(
+                    "browser",
+                    format!(
+                        "Configured session CDP endpoint `{normalized}` (reachable: `{}`, active_tabs: `{}`).",
+                        st.local_cdp_available, st.active_tabs
+                    ),
+                )
+                .with_mutated(vec!["browser_cdp_url".into(), "browser".into()])
+            }
+            Some("on") | Some("enable") | Some("true") | Some("1") => {
+                self.update_session_settings(session_id, |s| {
+                    s.browser_attached = true;
+                });
+                if let Ok(mut reg) = self.session_toolset_registry(session_id).write() {
+                    reg.enable(ToolsetId::Browser);
+                }
+                if let Some(ref provider) = ctx.browser_provider {
+                    if let Ok(st) = provider.status(user_id, bot_u64).await {
+                        if st.run_policy
+                            == gpui_telegram_proto::browser_contracts::BrowserRunPolicy::Disabled
+                        {
+                            let _ = provider
+                                .set_policy(
+                                    user_id,
+                                    bot_u64,
+                                    gpui_telegram_proto::browser_contracts::BrowserRunPolicy::AskEveryTime,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                CommandExecutionOutcome::ok(
+                    "browser",
+                    "Browser automation enabled (`ToolsetId::Browser` active).",
+                )
+                .with_mutated(vec!["browser".into(), "toolsets".into()])
+            }
+            Some("off") | Some("disable") | Some("false") | Some("0") => {
+                self.update_session_settings(session_id, |s| {
+                    s.browser_attached = false;
+                });
+                if let Ok(mut reg) = self.session_toolset_registry(session_id).write() {
+                    reg.disable(ToolsetId::Browser);
+                }
+                CommandExecutionOutcome::ok(
+                    "browser",
+                    "Browser automation disabled (`ToolsetId::Browser` inactive for this session).",
+                )
+                .with_mutated(vec!["browser".into(), "toolsets".into()])
+            }
+            Some("policy") => {
+                let Some(raw_mode) =
+                    parsed.argv.get(1).map(|s| s.trim()).filter(|s| !s.is_empty())
+                else {
+                    return CommandExecutionOutcome::err(
+                        "browser",
+                        "Usage: `/browser policy <ask_every_time|allow_read_only|always_allow_authorized|disabled>`",
+                    );
+                };
+                let Some(policy) = commands::parse_browser_run_policy_arg(raw_mode) else {
+                    return CommandExecutionOutcome::err(
+                        "browser",
+                        format!(
+                            "Unknown browser policy `{raw_mode}`. Valid policies: `ask_every_time`, `allow_read_only`, `always_allow_authorized`, `disabled`."
+                        ),
+                    );
+                };
+                self.update_session_settings(session_id, |s| {
+                    s.config_overrides.insert(
+                        "browser_run_policy".to_string(),
+                        policy.as_str().to_string(),
+                    );
+                });
+                if let Some(ref provider) = ctx.browser_provider {
+                    if let Err(err) = provider.set_policy(user_id, bot_u64, policy).await {
+                        return CommandExecutionOutcome::err("browser", err);
+                    }
+                }
+                CommandExecutionOutcome::ok(
+                    "browser",
+                    format!("BrowserRunPolicy updated to `{}`.", policy.as_str()),
+                )
+                .with_mutated(vec!["browser_run_policy".into()])
+            }
+            Some("stop") | Some("kill") | Some("emergency-stop") | Some("emergency_stop") => {
+                self.update_session_settings(session_id, |s| {
+                    s.browser_attached = false;
+                    s.config_overrides
+                        .insert("browser_run_policy".to_string(), "disabled".to_string());
+                });
+                if let Ok(mut reg) = self.session_toolset_registry(session_id).write() {
+                    reg.disable(ToolsetId::Browser);
+                }
+                if let Some(ref provider) = ctx.browser_provider {
+                    let _ = provider
+                        .emergency_stop(
+                            user_id,
+                            bot_u64,
+                            Some("User invoked /browser stop".to_string()),
+                        )
+                        .await;
+                }
+                browser_cdp::global_cdp_manager().stop_managed_chromium();
+                CommandExecutionOutcome::ok(
+                    "browser",
+                    "Emergency browser stop engaged: browser policy set to `disabled`, pending approvals cancelled, and browser sessions detached.",
+                )
+                .with_mutated(vec!["browser".into(), "browser_run_policy".into()])
+            }
+            Some(other)
+                if other.contains("://")
+                    || other.starts_with("about:")
+                    || other.starts_with("javascript:")
+                    || other.starts_with("data:") =>
+            {
+                let safe_url = match browser_bridge::validate_navigable_browser_url(other, true) {
+                    Ok(u) => u,
+                    Err((code, msg)) => {
+                        return CommandExecutionOutcome::err(
+                            "browser",
+                            format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                        );
+                    }
+                };
+                let res = HermesToolExecutor::execute(
+                    "browser_navigate",
+                    json!({ "url": safe_url }),
+                    &ctx,
+                )
+                .await;
+                if res.success {
+                    CommandExecutionOutcome::ok("browser", res.output)
+                        .with_mutated(vec!["browser".into()])
+                } else {
+                    CommandExecutionOutcome::err("browser", res.output)
+                }
+            }
+            Some(unknown) => CommandExecutionOutcome::err(
+                "browser",
+                format!(
+                    "Unknown `/browser` subcommand `{unknown}`. {}",
+                    commands::BROWSER_COMMAND_USAGE
+                ),
+            ),
+        }
     }
 
     pub fn cancel_session(&self, session_id: &str) -> bool {
@@ -3766,12 +4177,16 @@ impl HermesEngine {
 
             // 1. Slash Command Intercept
             if !req.skip_slash_commands && SlashCommandParser::is_slash_command(&req.prompt) {
-                match engine.execute_command(
-                    Some(&initial_session_id),
-                    req.chat_id.or(sess.chat_id),
-                    req.bot_id.as_deref().or(sess.bot_id.as_deref()),
-                    &req.prompt,
-                ) {
+                match engine
+                    .execute_command_async(
+                        Some(&initial_session_id),
+                        req.chat_id.or(sess.chat_id),
+                        req.bot_id.as_deref().or(sess.bot_id.as_deref()),
+                        req.user_id.as_deref(),
+                        &req.prompt,
+                    )
+                    .await
+                {
                     Ok((resolved_sid, outcome)) => {
                         emit_event(
                             &tx,
@@ -4755,6 +5170,8 @@ impl HermesEngine {
                     duration_ms: result.duration_ms,
                     inline_buttons: result.inline_buttons.clone(),
                     ui_actions: result.ui_actions.clone(),
+                    artifact: result.artifacts.first().cloned(),
+                    artifacts: result.artifacts.clone(),
                 };
                 recorded.push(res_ev.clone());
                 let _ = tx.send(res_ev).await;

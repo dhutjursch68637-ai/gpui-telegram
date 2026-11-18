@@ -1,5 +1,6 @@
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::browser_contracts::BrowserRunPolicy;
 use gpui_telegram_proto::miniapp_contracts::{
     CLASSIC_INITIALS_AVATAR_SHAPE, GROK_AVATAR_SHAPES, PatchFabushiBotRequest,
 };
@@ -687,7 +688,223 @@ pub fn render_bot_profile_main(
             )
         })
         .child(action_rows)
+        .child(render_bot_browser_control_card(inspector, pal, lang, cx))
         .when_some(owner_section, |col, owner| col.child(owner))
+        .into_any_element()
+}
+
+fn render_bot_browser_control_card(
+    inspector: &ContextInspector,
+    pal: TdesktopThemePalette,
+    lang: &str,
+    cx: &mut Context<ContextInspector>,
+) -> AnyElement {
+    let bot_id = if inspector.profile.bot_id > 0 {
+        inspector.profile.bot_id
+    } else {
+        777000
+    };
+    let br = &inspector.browser_bridge;
+    let effective_policy = inspector
+        .bot_browser_profile
+        .as_ref()
+        .map(|p| p.run_policy)
+        .unwrap_or(br.run_policy);
+    let copy_tok = br.pairing_token.clone();
+    let copied_prefix = tr_str(lang, "已复制配对码", "Copied token").to_string();
+
+    let (badge_text, badge_color) = if br.emergency_stopped || effective_policy == BrowserRunPolicy::Disabled {
+        (tr_str(lang, "已禁用", "Disabled").to_string(), pal.danger)
+    } else if br.extension_connected {
+        (
+            format!("{} ({})", tr_str(lang, "已连接", "Paired"), br.active_tabs),
+            pal.success,
+        )
+    } else if br.local_cdp_available {
+        (tr_str(lang, "CDP 就绪", "CDP Ready").to_string(), pal.accent)
+    } else {
+        (tr_str(lang, "未配对", "Unpaired").to_string(), pal.text_secondary)
+    };
+
+    let policies = [
+        (BrowserRunPolicy::AlwaysAllowAuthorized, tr_str(lang, "自动", "Auto")),
+        (BrowserRunPolicy::AllowReadOnly, tr_str(lang, "只读", "Read-Only")),
+        (BrowserRunPolicy::AskEveryTime, tr_str(lang, "询问", "Ask")),
+        (BrowserRunPolicy::Disabled, tr_str(lang, "禁用", "Off")),
+    ];
+
+    div()
+        .w_full()
+        .p(px(12.0))
+        .rounded(px(14.0))
+        .bg(rgb(pal.card_bg))
+        .border_1()
+        .border_color(rgb(pal.border_fg))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(tg_icon(IconName::ComputerDesktop, 15.0, pal.accent))
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(pal.text_primary))
+                                .child(tr_str(lang, "浏览器控制桥接", "Browser Control")),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(7.0))
+                        .py(px(1.5))
+                        .rounded(px(999.0))
+                        .bg(TdesktopThemePalette::rgba_with_alpha(badge_color, 0.14))
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(badge_color))
+                        .child(badge_text),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(pal.text_secondary))
+                .child(format!(
+                    "127.0.0.1:{} · Token {}",
+                    br.port,
+                    br.masked_token()
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(5.0))
+                .children(policies.into_iter().map(|(pol, label)| {
+                    let selected = effective_policy == pol;
+                    div()
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(3.0))
+                        .rounded(px(7.0))
+                        .bg(rgb(if selected { pal.accent } else { pal.input_bg }))
+                        .text_size(px(11.0))
+                        .font_weight(if selected {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(rgb(if selected {
+                            pal.active_button_fg
+                        } else {
+                            pal.text_primary
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.browser_bridge.run_policy = pol;
+                                if let Some(ref mut p) = this.bot_browser_profile {
+                                    p.run_policy = pol;
+                                    p.enabled = pol != BrowserRunPolicy::Disabled;
+                                }
+                                this.pending_action = Some(InspectorAction::SetBotBrowserPolicy {
+                                    bot_id,
+                                    policy: pol,
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(label.to_string())
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .id("inspector-copy-browser-token")
+                        .cursor_pointer()
+                        .flex_1()
+                        .py(px(5.0))
+                        .rounded(px(7.0))
+                        .bg(rgb(pal.input_bg))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .text_color(rgb(pal.text_link))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.copied_feedback = Some(copied_prefix.clone());
+                                this.pending_action =
+                                    Some(InspectorAction::CopyText(copy_tok.clone()));
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "复制配对码", "Copy Token")),
+                )
+                .child(
+                    div()
+                        .id("inspector-launch-cdp")
+                        .cursor_pointer()
+                        .flex_1()
+                        .py(px(5.0))
+                        .rounded(px(7.0))
+                        .bg(rgb(pal.input_bg))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .text_color(rgb(pal.accent))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.pending_action =
+                                    Some(InspectorAction::LaunchManagedChromiumCdp);
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "托管 Chromium", "Chromium CDP")),
+                )
+                .child(
+                    div()
+                        .id("inspector-browser-emergency-stop")
+                        .cursor_pointer()
+                        .px(px(8.0))
+                        .py(px(5.0))
+                        .rounded(px(7.0))
+                        .bg(rgb(pal.danger))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(pal.active_button_fg))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.browser_bridge.emergency_stopped = true;
+                                this.browser_bridge.run_policy = BrowserRunPolicy::Disabled;
+                                this.pending_action =
+                                    Some(InspectorAction::TriggerBrowserEmergencyStop { bot_id });
+                                cx.notify();
+                            }),
+                        )
+                        .child(tr_str(lang, "急停", "Stop")),
+                ),
+        )
         .into_any_element()
 }
 

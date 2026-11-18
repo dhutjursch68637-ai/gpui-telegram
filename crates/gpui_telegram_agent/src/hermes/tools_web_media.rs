@@ -2,15 +2,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 use gpui_telegram_media::{
     compute_pcm_rms_level, decode_wav_pcm, encode_wav_i16, waveform_from_pcm_i16,
     ThumbnailGenerator,
 };
+use gpui_telegram_proto::browser_contracts::{
+    sanitize_download_filename, validate_browser_tool_arguments, BrowserCommandRequest,
+};
 
+use super::browser_bridge::{
+    canonicalize_browser_tool_name, to_browser_injection_dto, validate_navigable_browser_url,
+};
+use super::browser_cdp::{global_cdp_manager, parse_image_dimensions_from_b64};
 use super::security::scan_content_for_injection;
 use super::toolsets::{HermesToolArtifact, HermesToolContext, HermesToolResult};
 
@@ -19,14 +23,12 @@ pub async fn execute_web_media_tool(
     args: Value,
     ctx: &HermesToolContext,
 ) -> HermesToolResult {
+    if canonicalize_browser_tool_name(name).is_some() {
+        return execute_browser_tool(name, args, ctx).await;
+    }
     match name {
         "web_search" => tool_web_search(args, ctx).await,
         "web_extract" => tool_web_extract(args, ctx).await,
-        "browser_navigate" => tool_browser_navigate(args, ctx).await,
-        "browser_snapshot" => tool_browser_snapshot(args, ctx).await,
-        "browser_click" => tool_browser_click(args, ctx).await,
-        "browser_type" => tool_browser_type(args, ctx).await,
-        "browser_screenshot" => tool_browser_screenshot(args, ctx).await,
         "text_to_speech" => tool_text_to_speech(args, ctx).await,
         "speech_to_text" => tool_speech_to_text(args, ctx).await,
         "vision_analyze" => tool_vision_analyze(args, ctx).await,
@@ -627,356 +629,369 @@ fn percent_encode(input: &str) -> String {
 }
 
 // ----------------------------------------------------------------------------
-// Chrome DevTools Protocol (CDP) Browser Tools
+// Dual-Mode Browser Control Toolset (Bridge Relay Primary + CDP Fallback)
 // ----------------------------------------------------------------------------
 
-fn resolve_cdp_http_base(args: &Value, ctx: &HermesToolContext) -> String {
-    args.get("cdp_url")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .or_else(|| ctx.browser_cdp_url.clone())
-        .or_else(|| std::env::var("HERMES_BROWSER_CDP_URL").ok())
-        .unwrap_or_else(|| "http://127.0.0.1:9222".into())
-}
-
-async fn resolve_cdp_ws_url(http_base: &str, ctx: &HermesToolContext) -> Result<String, String> {
-    if http_base.starts_with("ws://") || http_base.starts_with("wss://") {
-        return Ok(http_base.to_string());
-    }
-    let list_url = format!("{}/json/list", http_base.trim_end_matches('/'));
-    let resp = ctx
-        .http_client
-        .get(&list_url)
-        .timeout(Duration::from_secs(2))
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "Chrome CDP endpoint not reachable at {http_base} ({e}). Start Chrome with --remote-debugging-port=9222 or set HERMES_BROWSER_CDP_URL."
-            )
-        })?;
-    let targets: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed parsing CDP /json/list response: {e}"))?;
-    let ws_url = targets
-        .as_array()
-        .and_then(|arr| {
-            arr.iter()
-                .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
-                .or_else(|| arr.first())
-        })
-        .and_then(|t| t.get("webSocketDebuggerUrl"))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "No active page target with webSocketDebuggerUrl in CDP /json/list".to_string())?;
-    Ok(ws_url.to_string())
-}
-
-async fn send_cdp_command(
-    http_base: &str,
-    method: &str,
-    params: Value,
+async fn execute_browser_tool(
+    raw_name: &str,
+    mut args: Value,
     ctx: &HermesToolContext,
-) -> Result<Value, String> {
-    let ws_url = resolve_cdp_ws_url(http_base, ctx).await?;
-    let rest = ws_url
-        .strip_prefix("ws://")
-        .ok_or_else(|| format!("Only ws:// local CDP WebSocket URLs supported natively (got '{ws_url}')"))?;
-    let (host_port, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
+) -> HermesToolResult {
+    let Some(canonical) = canonicalize_browser_tool_name(raw_name) else {
+        return HermesToolResult::err(raw_name, format!("Unknown browser tool '{raw_name}'"));
     };
 
-    let mut stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(host_port))
-        .await
-        .map_err(|_| format!("Timed out connecting to CDP WebSocket {host_port}"))?
-        .map_err(|e| format!("Failed connecting to CDP WebSocket {host_port}: {e}"))?;
-
-    let ws_key = base64_encode(uuid::Uuid::new_v4().as_bytes());
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host_port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {ws_key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    );
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|e| format!("CDP WS handshake write failed: {e}"))?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .await
-        .map_err(|e| format!("CDP WS handshake read failed: {e}"))?;
-    if !status_line.contains("101") {
-        return Err(format!("CDP WS handshake rejected: {}", status_line.trim()));
+    if args.is_null() {
+        args = json!({});
     }
-    loop {
-        let mut hdr = String::new();
-        reader
-            .read_line(&mut hdr)
-            .await
-            .map_err(|e| format!("CDP WS header read failed: {e}"))?;
-        if hdr.trim().is_empty() {
-            break;
-        }
+    if let Err(err) = validate_browser_tool_arguments(&args) {
+        return HermesToolResult::err(raw_name, err);
     }
 
-    let payload = json!({ "id": 1, "method": method, "params": params }).to_string();
-    let frame = encode_ws_client_text_frame(payload.as_bytes());
-    reader
-        .get_mut()
-        .write_all(&frame)
-        .await
-        .map_err(|e| format!("CDP WS frame send failed: {e}"))?;
-
-    // Read frames until response with id == 1 arrives
-    for _ in 0..32 {
-        let frame_bytes = tokio::time::timeout(Duration::from_secs(5), read_ws_frame(&mut reader))
-            .await
-            .map_err(|_| format!("Timed out waiting for CDP response to '{method}'"))??;
-        if let Ok(msg) = serde_json::from_slice::<Value>(&frame_bytes) {
-            if msg.get("id").and_then(|v| v.as_u64()) == Some(1) {
-                if let Some(err) = msg.get("error") {
-                    return Err(format!("CDP error in '{method}': {err}"));
-                }
-                return Ok(msg.get("result").cloned().unwrap_or(json!({})));
+    match canonical {
+        "browser_open_tab" => {
+            let raw_url = args
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("about:blank");
+            if let Err((code, msg)) = validate_navigable_browser_url(raw_url, true) {
+                return HermesToolResult::err(
+                    raw_name,
+                    format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                );
             }
         }
-    }
-    Err(format!("Did not receive CDP response id=1 for '{method}'"))
-}
-
-fn encode_ws_client_text_frame(payload: &[u8]) -> Vec<u8> {
-    let mask = [0x37u8, 0xFA, 0x21, 0x3D];
-    let mut frame = Vec::with_capacity(payload.len() + 14);
-    frame.push(0x81); // FIN + Text
-    let len = payload.len();
-    if len < 126 {
-        frame.push(0x80 | (len as u8));
-    } else if len <= 65535 {
-        frame.push(0x80 | 126);
-        frame.extend_from_slice(&(len as u16).to_be_bytes());
-    } else {
-        frame.push(0x80 | 127);
-        frame.extend_from_slice(&(len as u64).to_be_bytes());
-    }
-    frame.extend_from_slice(&mask);
-    for (idx, b) in payload.iter().enumerate() {
-        frame.push(b ^ mask[idx % 4]);
-    }
-    frame
-}
-
-async fn read_ws_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>, String> {
-    let mut hdr = [0u8; 2];
-    reader
-        .read_exact(&mut hdr)
-        .await
-        .map_err(|e| format!("WS frame header read failed: {e}"))?;
-    let masked = (hdr[1] & 0x80) != 0;
-    let mut len = (hdr[1] & 0x7F) as u64;
-    if len == 126 {
-        let mut ext = [0u8; 2];
-        reader.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
-        len = u16::from_be_bytes(ext) as u64;
-    } else if len == 127 {
-        let mut ext = [0u8; 8];
-        reader.read_exact(&mut ext).await.map_err(|e| e.to_string())?;
-        len = u64::from_be_bytes(ext);
-    }
-    let mut mask_key = [0u8; 4];
-    if masked {
-        reader
-            .read_exact(&mut mask_key)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    let mut data = vec![0u8; len as usize];
-    reader
-        .read_exact(&mut data)
-        .await
-        .map_err(|e| format!("WS payload read failed: {e}"))?;
-    if masked {
-        for (i, b) in data.iter_mut().enumerate() {
-            *b ^= mask_key[i % 4];
+        "browser_navigate" => {
+            let Some(raw_url) = args
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return HermesToolResult::err(raw_name, "Missing required 'url' parameter");
+            };
+            if let Err((code, msg)) = validate_navigable_browser_url(raw_url, true) {
+                return HermesToolResult::err(
+                    raw_name,
+                    format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                );
+            }
         }
-    }
-    Ok(data)
-}
-
-async fn tool_browser_navigate(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let Some(url) = args.get("url").and_then(|v| v.as_str()) else {
-        return HermesToolResult::err("browser_navigate", "Missing required 'url'");
-    };
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    match send_cdp_command(&cdp_base, "Page.navigate", json!({ "url": url }), ctx).await {
-        Ok(res) => HermesToolResult::ok(
-            "browser_navigate",
-            format!("Navigated browser tab to {url}"),
-            Some(res),
-        ),
-        Err(e) => HermesToolResult::err("browser_navigate", e),
-    }
-}
-
-async fn tool_browser_snapshot(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    let selector = args.get("selector").and_then(|v| v.as_str());
-    let expr = match selector {
-        Some(sel) => format!(
-            "(() => {{ const el = document.querySelector({:?}); return JSON.stringify({{ title: document.title, url: location.href, text: el ? el.innerText : '' }}); }})()",
-            sel
-        ),
-        None => "(() => JSON.stringify({ title: document.title, url: location.href, text: document.body ? document.body.innerText.slice(0, 12000) : '' }))()".into(),
-    };
-    match send_cdp_command(
-        &cdp_base,
-        "Runtime.evaluate",
-        json!({ "expression": expr, "returnByValue": true }),
-        ctx,
-    )
-    .await
-    {
-        Ok(res) => {
-            let val_str = res
-                .get("result")
-                .and_then(|r| r.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            HermesToolResult::ok(
-                "browser_snapshot",
-                val_str.to_string(),
-                serde_json::from_str(val_str).ok(),
-            )
-        }
-        Err(e) => HermesToolResult::err("browser_snapshot", e),
-    }
-}
-
-async fn tool_browser_click(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    if let Some(sel) = args.get("selector").and_then(|v| v.as_str()) {
-        let expr = format!(
-            "(() => {{ const el = document.querySelector({:?}); if (!el) return 'NOT_FOUND'; el.click(); return 'CLICKED'; }})()",
-            sel
-        );
-        return match send_cdp_command(
-            &cdp_base,
-            "Runtime.evaluate",
-            json!({ "expression": expr, "returnByValue": true }),
-            ctx,
-        )
-        .await
-        {
-            Ok(res) => HermesToolResult::ok(
-                "browser_click",
-                format!("Clicked selector '{sel}': {res}"),
-                Some(res),
-            ),
-            Err(e) => HermesToolResult::err("browser_click", e),
-        };
-    }
-
-    if let (Some(x), Some(y)) = (
-        args.get("x").and_then(|v| v.as_f64()),
-        args.get("y").and_then(|v| v.as_f64()),
-    ) {
-        let _ = send_cdp_command(
-            &cdp_base,
-            "Input.dispatchMouseEvent",
-            json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1 }),
-            ctx,
-        )
-        .await;
-        return match send_cdp_command(
-            &cdp_base,
-            "Input.dispatchMouseEvent",
-            json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1 }),
-            ctx,
-        )
-        .await
-        {
-            Ok(res) => HermesToolResult::ok(
-                "browser_click",
-                format!("Clicked coordinates ({x}, {y})"),
-                Some(res),
-            ),
-            Err(e) => HermesToolResult::err("browser_click", e),
-        };
-    }
-
-    HermesToolResult::err("browser_click", "Provide either 'selector' or ('x', 'y')")
-}
-
-async fn tool_browser_type(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let Some(text) = args.get("text").and_then(|v| v.as_str()) else {
-        return HermesToolResult::err("browser_type", "Missing required 'text'");
-    };
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    if let Some(sel) = args.get("selector").and_then(|v| v.as_str()) {
-        let focus_expr = format!("document.querySelector({:?})?.focus()", sel);
-        let _ = send_cdp_command(
-            &cdp_base,
-            "Runtime.evaluate",
-            json!({ "expression": focus_expr }),
-            ctx,
-        )
-        .await;
-    }
-    match send_cdp_command(&cdp_base, "Input.insertText", json!({ "text": text }), ctx).await {
-        Ok(res) => HermesToolResult::ok(
-            "browser_type",
-            format!("Typed {} character(s)", text.chars().count()),
-            Some(res),
-        ),
-        Err(e) => HermesToolResult::err("browser_type", e),
-    }
-}
-
-async fn tool_browser_screenshot(args: Value, ctx: &HermesToolContext) -> HermesToolResult {
-    let cdp_base = resolve_cdp_http_base(&args, ctx);
-    let capture_beyond = args
-        .get("full_page")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    match send_cdp_command(
-        &cdp_base,
-        "Page.captureScreenshot",
-        json!({ "format": "png", "captureBeyondViewport": capture_beyond }),
-        ctx,
-    )
-    .await
-    {
-        Ok(res) => {
-            let b64 = res.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let mut out_path = None;
-            if let Some(raw_p) = args.get("output_path").and_then(|v| v.as_str()) {
-                if let Ok(sec) = ctx.security.read() {
-                    if let Ok(resolved) = sec.validate_path(Path::new(raw_p)) {
-                        if let Ok(bytes) = base64_decode(&b64) {
-                            let _ = fs::write(&resolved, bytes);
-                            out_path = Some(resolved.display().to_string());
+        "browser_download_url" => {
+            let Some(raw_url) = args
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return HermesToolResult::err(raw_name, "Missing required 'url' parameter");
+            };
+            if let Err((code, msg)) = validate_navigable_browser_url(raw_url, false) {
+                return HermesToolResult::err(
+                    raw_name,
+                    format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                );
+            }
+            if let Some(obj) = args.as_object_mut() {
+                if let Some(raw_fn) = obj
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                {
+                    match sanitize_download_filename(&raw_fn) {
+                        Some(clean) => {
+                            obj.insert("filename".to_string(), Value::String(clean));
+                        }
+                        None => {
+                            obj.remove("filename");
                         }
                     }
                 }
             }
-            HermesToolResult::ok(
-                "browser_screenshot",
-                format!("Captured browser screenshot ({} base64 chars)", b64.len()),
-                Some(json!({ "format": "png", "output_path": out_path })),
-            )
-            .with_artifact(HermesToolArtifact {
-                kind: "image".into(),
-                name: "browser_screenshot.png".into(),
-                mime_type: "image/png".into(),
-                path: out_path,
-                data_base64: Some(b64),
-                metadata: json!({ "source": "cdp" }),
-            })
         }
-        Err(e) => HermesToolResult::err("browser_screenshot", e),
+        "browser_manage_cookies" => {
+            if let Some(raw_url) = args
+                .get("url")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Err((code, msg)) = validate_navigable_browser_url(raw_url, false) {
+                    return HermesToolResult::err(
+                        raw_name,
+                        format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let explicit_cdp = args
+        .get("cdp_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let bot_u64 = ctx.bot_id.and_then(|id| u64::try_from(id).ok());
+
+    let cmd_res = if !explicit_cdp {
+        if let Some(ref provider) = ctx.browser_provider {
+            if provider.should_route_via_bridge(ctx.user_id, bot_u64) {
+                let req = BrowserCommandRequest {
+                    command_id: None,
+                    tool: canonical.to_string(),
+                    arguments: args.clone(),
+                    bot_id: bot_u64,
+                    bot_name: ctx.bound_agent_id.clone(),
+                    chat_id: ctx.chat_id,
+                    timeout_ms: args.get("timeout_ms").and_then(Value::as_u64),
+                };
+                match provider.execute(ctx.user_id, req).await {
+                    Ok(res) => res,
+                    Err(err) => return HermesToolResult::err(raw_name, err),
+                }
+            } else {
+                match global_cdp_manager()
+                    .execute_tool(canonical, &args, ctx.browser_cdp_url.as_deref())
+                    .await
+                {
+                    Ok(res) => res,
+                    Err((code, msg)) => {
+                        return HermesToolResult::err(
+                            raw_name,
+                            format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                        );
+                    }
+                }
+            }
+        } else {
+            match global_cdp_manager()
+                .execute_tool(canonical, &args, ctx.browser_cdp_url.as_deref())
+                .await
+            {
+                Ok(res) => res,
+                Err((code, msg)) => {
+                    return HermesToolResult::err(
+                        raw_name,
+                        format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                    );
+                }
+            }
+        }
+    } else {
+        match global_cdp_manager()
+            .execute_tool(canonical, &args, ctx.browser_cdp_url.as_deref())
+            .await
+        {
+            Ok(res) => res,
+            Err((code, msg)) => {
+                return HermesToolResult::err(
+                    raw_name,
+                    format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                );
+            }
+        }
+    };
+
+    if !cmd_res.ok {
+        let code_str = cmd_res.error_code.as_deref().unwrap_or("BROWSER_ERROR");
+        let rpc_code = cmd_res.rpc_code.unwrap_or(-32603);
+        let msg = cmd_res
+            .error_message
+            .unwrap_or_else(|| "Browser command failed".to_string());
+        return HermesToolResult::err(raw_name, format!("{code_str} ({rpc_code}): {msg}"));
+    }
+
+    let mut payload = if cmd_res.data.is_object() {
+        cmd_res.data.clone()
+    } else if cmd_res.data.is_null() {
+        json!({ "ok": true })
+    } else {
+        json!({ "ok": true, "result": cmd_res.data })
+    };
+
+    if let Some(obj) = payload.as_object_mut() {
+        obj.entry("ok".to_string()).or_insert(Value::Bool(true));
+        if let Some(tid) = cmd_res.tab_id {
+            obj.entry("tab_id".to_string()).or_insert_with(|| json!(tid));
+        }
+        if let Some(ref url) = cmd_res.url {
+            obj.entry("url".to_string()).or_insert_with(|| json!(url));
+        }
+        if let Some(ref title) = cmd_res.title {
+            obj.entry("title".to_string()).or_insert_with(|| json!(title));
+        }
+        if !cmd_res.executed_via.is_empty() {
+            obj.entry("executed_via".to_string())
+                .or_insert_with(|| json!(cmd_res.executed_via));
+        }
+    }
+
+    // Untrusted DOM/Markdown prompt-injection & secret scrubbing
+    if canonical == "browser_snapshot" {
+        scrub_browser_text_field(&mut payload, "markdown_excerpt");
+    } else if canonical == "browser_extract_markdown" {
+        scrub_browser_text_field(&mut payload, "markdown");
+    } else if canonical == "browser_manage_cookies" {
+        redact_http_only_cookies(&mut payload);
+    }
+
+    if canonical == "browser_screenshot" {
+        let raw_b64 = cmd_res
+            .artifact
+            .as_ref()
+            .map(|a| a.data_base64.as_str())
+            .or_else(|| payload.get("data_base64").and_then(Value::as_str))
+            .unwrap_or("");
+        let clean_b64 = strip_data_url_prefix(raw_b64).to_string();
+        let mime_type = cmd_res
+            .artifact
+            .as_ref()
+            .map(|a| a.mime_type.as_str())
+            .or_else(|| payload.get("mime_type").and_then(Value::as_str))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("image/png")
+            .to_string();
+        let (probed_w, probed_h) = parse_image_dimensions_from_b64(&clean_b64).unwrap_or((0, 0));
+        let width = cmd_res
+            .artifact
+            .as_ref()
+            .and_then(|a| a.width)
+            .or_else(|| payload.get("width").and_then(Value::as_u64).map(|v| v as u32))
+            .filter(|&v| v > 0)
+            .or((probed_w > 0).then_some(probed_w));
+        let height = cmd_res
+            .artifact
+            .as_ref()
+            .and_then(|a| a.height)
+            .or_else(|| payload.get("height").and_then(Value::as_u64).map(|v| v as u32))
+            .filter(|&v| v > 0)
+            .or((probed_h > 0).then_some(probed_h));
+
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("mime_type".to_string(), Value::String(mime_type.clone()));
+            obj.insert("data_base64".to_string(), Value::String(clean_b64.clone()));
+            if let Some(w) = width {
+                obj.insert("width".to_string(), json!(w));
+            }
+            if let Some(h) = height {
+                obj.insert("height".to_string(), json!(h));
+            }
+        }
+
+        let ext = if mime_type.contains("jpeg") || mime_type.contains("jpg") {
+            "jpg"
+        } else {
+            "png"
+        };
+        let summary_for_llm = json!({
+            "ok": true,
+            "tab_id": payload.get("tab_id").cloned().unwrap_or(Value::Null),
+            "url": payload.get("url").cloned().unwrap_or(Value::Null),
+            "title": payload.get("title").cloned().unwrap_or(Value::Null),
+            "mime_type": mime_type,
+            "width": width,
+            "height": height,
+            "base64_chars": clean_b64.len(),
+            "artifact_attached": !clean_b64.is_empty(),
+        });
+
+        let mut res = HermesToolResult::ok(
+            raw_name,
+            serde_json::to_string(&summary_for_llm).unwrap_or_default(),
+            Some(payload),
+        );
+        if !clean_b64.is_empty() {
+            res = res.with_artifact(HermesToolArtifact {
+                kind: "image".into(),
+                name: format!("browser_screenshot.{ext}"),
+                mime_type,
+                path: None,
+                data_base64: Some(clean_b64),
+                metadata: json!({
+                    "width": width,
+                    "height": height,
+                    "tab_id": cmd_res.tab_id,
+                    "url": cmd_res.url,
+                    "executed_via": cmd_res.executed_via,
+                }),
+            });
+        }
+        return res;
+    }
+
+    let output = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    HermesToolResult::ok(raw_name, output, Some(payload))
+}
+
+fn scrub_browser_text_field(payload: &mut Value, field: &str) {
+    let Some(raw_text) = payload
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    else {
+        return;
+    };
+    let scan = scan_content_for_injection(&raw_text);
+    let scan_dto = to_browser_injection_dto(&scan);
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(field.to_string(), Value::String(scan.sanitized_text));
+        let should_replace_scan = match obj.get("injection_scan") {
+            None => true,
+            Some(existing) => {
+                let existing_flagged = existing
+                    .get("flagged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                scan_dto.flagged || !existing_flagged
+            }
+        };
+        if should_replace_scan {
+            if let Ok(scan_val) = serde_json::to_value(&scan_dto) {
+                obj.insert("injection_scan".to_string(), scan_val);
+            }
+        }
     }
 }
+
+fn redact_http_only_cookies(payload: &mut Value) {
+    let Some(cookies) = payload
+        .get_mut("cookies")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for item in cookies.iter_mut() {
+        if let Some(obj) = item.as_object_mut() {
+            let is_http_only = obj
+                .get("http_only")
+                .or_else(|| obj.get("httpOnly"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_http_only {
+                obj.insert(
+                    "value".to_string(),
+                    Value::String("[REDACTED_HTTPONLY]".to_string()),
+                );
+                obj.insert("redacted".to_string(), Value::Bool(true));
+            }
+        }
+    }
+}
+
+fn strip_data_url_prefix(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let Some(idx) = trimmed.find(";base64,") {
+        if trimmed[..idx].starts_with("data:") {
+            return &trimmed[idx + 8..];
+        }
+    }
+    trimmed
+}
+
 
 // ----------------------------------------------------------------------------
 // Audio TTS / STT, Vision, ImageGen, VideoGen

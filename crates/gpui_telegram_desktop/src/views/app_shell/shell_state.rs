@@ -371,6 +371,7 @@ impl ShellThemeVisualState {
 pub struct ShellComputersState {
     pub computers: Vec<ComputerNodeDto>,
     pub bot_profiles: HashMap<u64, BotComputerProfileDto>,
+    pub bot_browser_profiles: HashMap<u64, gpui_telegram_proto::browser_contracts::BotBrowserProfileDto>,
     pub pending_approvals: Vec<PendingComputerCommandDto>,
     pub current_host_node_id: Option<String>,
     pub relay_loop_started: bool,
@@ -386,11 +387,14 @@ impl ShellComputersState {
     pub fn reset_on_logout(&mut self) {
         self.computers.clear();
         self.bot_profiles.clear();
+        self.bot_browser_profiles.clear();
         self.pending_approvals.clear();
         self.current_host_node_id = None;
         self.relay_loop_started = false;
         self.relay_generation = self.relay_generation.wrapping_add(1);
         self.tailnet_status = None;
+        crate::browser_bridge::global_desktop_browser_bridge()
+            .connect_upstream_server(String::new(), None);
     }
 }
 

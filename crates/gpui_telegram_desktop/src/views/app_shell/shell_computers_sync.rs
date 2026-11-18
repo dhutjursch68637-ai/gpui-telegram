@@ -6,14 +6,16 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, AppContext, AsyncApp, Context, Entity, WeakEntity};
+use gpui::{App, AppContext, AsyncApp, ClipboardItem, Context, Entity, WeakEntity};
 use gpui_telegram_client::TelegramClient;
+use gpui_telegram_proto::browser_contracts::{BrowserRunPolicy, UpdateBotBrowserProfileRequest};
 use gpui_telegram_proto::computer_contracts::{
     ComputerListResponse, ComputerNodeDto, ComputerNodeKind, PendingComputerCommandDto,
     RemoteComputerCommandRequest, RemoteComputerOp, UpdateBotComputerRequest,
     UpdateComputerPolicyRequest, UpsertCloudComputerRequest,
 };
 
+use crate::browser_bridge::global_desktop_browser_bridge;
 use crate::i18n::tr_str;
 use crate::views::computer_workbench::{ComputerWorkbench, WorkbenchCommand};
 use crate::views::drawer::inspector_tabs::{InspectorAction, InspectorSubpage};
@@ -135,17 +137,26 @@ impl AppShell {
         )
     }
 
-    /// Synchronizes cached computers and bot computer profiles into Inspector, Settings, and Workbench.
+    /// Synchronizes cached computers, live browser bridge state, and bot profiles into Inspector, Settings, Tasks Workspace, and Workbench.
     pub fn sync_computers_to_views(&mut self, cx: &mut Context<Self>) {
         let nodes = self.computers.computers.clone();
         let tailnet_status = self.computers.tailnet_status.clone();
+        let br_snap = global_desktop_browser_bridge().snapshot();
         let bots = self.known_bots_for_computers(cx);
         let active_bot_id = self.effective_inspector_bot_id(cx);
         let active_bot_profile = active_bot_id
             .and_then(|id| self.computers.bot_profiles.get(&id).cloned());
+        let active_bot_browser_profile = active_bot_id
+            .and_then(|id| self.computers.bot_browser_profiles.get(&id).cloned());
+
+        self.tasks_workspace.update(cx, |tw, tw_cx| {
+            tw.sync_browser_bridge(br_snap.clone());
+            tw_cx.notify();
+        });
 
         self.inspector.update(cx, |insp, icx| {
             insp.sync_computers(nodes.clone());
+            insp.sync_browser_bridge(br_snap.clone());
             if let Some(id) = active_bot_id {
                 if insp.profile.is_bot && insp.profile.bot_id == 0 {
                     insp.profile.bot_id = id;
@@ -154,6 +165,9 @@ impl AppShell {
             if insp.profile.is_bot {
                 if let Some(prof) = active_bot_profile {
                     insp.sync_bot_computer_profile(Some(prof));
+                }
+                if let Some(br_prof) = active_bot_browser_profile {
+                    insp.sync_bot_browser_profile(Some(br_prof));
                 }
             }
             icx.notify();
@@ -165,33 +179,37 @@ impl AppShell {
                 sc.sync_computers(nodes.clone());
                 sc.sync_known_bots(bots, active_bot_id);
                 sc.sync_tailnet_status(tailnet_status.clone());
+                sc.sync_browser_bridge(br_snap.clone());
                 sc_cx.notify();
             });
         }
 
         if let Some(ref wb_ent) = self.overlays.computer_overlay.clone() {
             let target_id = wb_ent.read(cx).node_id.clone();
-            if let Some(tid) = target_id {
-                let node_opt = self.computers.computers.iter().find(|n| n.node_id == tid).cloned();
-                let peer_opt = tailnet_status.as_ref().and_then(|ts| {
+            let node_opt = target_id
+                .as_ref()
+                .and_then(|tid| self.computers.computers.iter().find(|n| &n.node_id == tid).cloned());
+            let peer_opt = target_id.as_ref().and_then(|tid| {
+                tailnet_status.as_ref().and_then(|ts| {
                     ts.peers.iter().find(|p| {
-                        p.node_id == tid
+                        &p.node_id == tid
                             || node_opt
                                 .as_ref()
                                 .and_then(|n| n.device_id.as_deref())
                                 .is_some_and(|did| !did.is_empty() && p.device_id == did)
                     })
-                });
-                if node_opt.is_some() || peer_opt.is_some() {
-                    wb_ent.update(cx, |wb, wcx| {
-                        if let Some(ref node_clone) = node_opt {
-                            wb.refresh_target_node_status(node_clone);
-                        }
-                        wb.sync_tailnet_peer_state(peer_opt);
-                        wcx.notify();
-                    });
+                })
+            });
+            wb_ent.update(cx, |wb, wcx| {
+                wb.sync_browser_bridge(br_snap);
+                if let Some(ref node_clone) = node_opt {
+                    wb.refresh_target_node_status(node_clone);
                 }
-            }
+                if target_id.is_some() {
+                    wb.sync_tailnet_peer_state(peer_opt);
+                }
+                wcx.notify();
+            });
         }
     }
 
@@ -234,6 +252,8 @@ impl AppShell {
         self.computers.relay_loop_started = true;
         self.client.bind_persistent_identity_dir(&self.preferences_dir);
         self.client.start_tailnet_mesh();
+        global_desktop_browser_bridge()
+            .connect_upstream_server(self.client.config.server_url.clone(), self.session_sync.session_token.clone());
         let client = self.client.clone();
 
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
@@ -385,7 +405,7 @@ impl AppShell {
         .detach();
     }
 
-    /// Ensures the active Inspector AI Bot gets its computer inventory and `BotComputerProfileDto`.
+    /// Ensures the active Inspector AI Bot gets its computer inventory, `BotComputerProfileDto`, and `BotBrowserProfileDto`.
     pub fn sync_active_bot_computer_to_inspector(&mut self, cx: &mut Context<Self>) {
         self.sync_computers_to_views(cx);
         let Some(bot_id) = self.effective_inspector_bot_id(cx) else {
@@ -400,16 +420,25 @@ impl AppShell {
         let client = self.client.clone();
         cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
             let c = client.clone();
-            let res = run_on_tokio(&client, async move {
-                c.get_bot_computer_profile_async(bot_id).await.map_err(|e| e.to_string())
+            let (comp_res, br_res) = run_on_tokio(&client, async move {
+                let comp = c
+                    .get_bot_computer_profile_async(bot_id)
+                    .await
+                    .map_err(|e| e.to_string());
+                let br = c
+                    .get_bot_browser_profile_async(bot_id)
+                    .await
+                    .map_err(|e| e.to_string());
+                (comp, br)
             })
             .await
-            .and_then(|inner| inner);
+            .unwrap_or_else(|e| (Err(e.clone()), Err(e)));
             let _ = weak.update(app, |shell, cx| {
                 if !shell.computer_fence_matches(fence) {
                     return;
                 }
-                if let Ok(profile) = res {
+                let mut changed = false;
+                if let Ok(profile) = comp_res {
                     shell.computers.bot_profiles.insert(bot_id, profile.clone());
                     if shell.effective_inspector_bot_id(cx) == Some(bot_id) {
                         shell.inspector.update(cx, |insp, icx| {
@@ -417,6 +446,22 @@ impl AppShell {
                             icx.notify();
                         });
                     }
+                    changed = true;
+                }
+                if let Ok(br_profile) = br_res {
+                    shell
+                        .computers
+                        .bot_browser_profiles
+                        .insert(bot_id, br_profile.clone());
+                    if shell.effective_inspector_bot_id(cx) == Some(bot_id) {
+                        shell.inspector.update(cx, |insp, icx| {
+                            insp.sync_bot_browser_profile(Some(br_profile));
+                            icx.notify();
+                        });
+                    }
+                    changed = true;
+                }
+                if changed {
                     cx.notify();
                 }
             });
@@ -493,6 +538,75 @@ impl AppShell {
         overlay: Entity<ComputerWorkbench>,
         cx: &mut Context<Self>,
     ) {
+        match &cmd {
+            WorkbenchCommand::LaunchManagedChromium => {
+                let client = self.client.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let res = run_on_tokio(&client, async move {
+                        global_desktop_browser_bridge().launch_managed_chromium().await
+                    })
+                    .await
+                    .and_then(|inner| inner);
+                    let _ = weak.update(app, |shell, cx| {
+                        let snap = global_desktop_browser_bridge().snapshot();
+                        overlay.update(cx, |wb, wcx| {
+                            wb.sync_browser_bridge(snap);
+                            wb.status_banner = Some(match &res {
+                                Ok(url) => format!(
+                                    "{}: {url}",
+                                    tr_str(
+                                        &wb.language_id,
+                                        "受管 Chromium CDP 已启动",
+                                        "Managed Chromium CDP ready"
+                                    )
+                                ),
+                                Err(e) => format!(
+                                    "{}: {e}",
+                                    tr_str(
+                                        &wb.language_id,
+                                        "启动 Chromium 失败",
+                                        "Chromium launch failed"
+                                    )
+                                ),
+                            });
+                            wcx.notify();
+                        });
+                        shell.sync_computers_to_views(cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+                return;
+            }
+            WorkbenchCommand::BrowserEmergencyStop => {
+                global_desktop_browser_bridge().trigger_emergency_stop(Some(
+                    "Emergency stop triggered from Computer Workbench".to_string(),
+                ));
+                let snap = global_desktop_browser_bridge().snapshot();
+                overlay.update(cx, |wb, wcx| {
+                    wb.sync_browser_bridge(snap);
+                    wb.status_banner = Some(
+                        tr_str(
+                            &wb.language_id,
+                            "已紧急停止浏览器自动化",
+                            "Browser automation emergency stopped",
+                        )
+                        .to_string(),
+                    );
+                    wcx.notify();
+                });
+                self.sync_computers_to_views(cx);
+                self.enqueue_computer_toast(
+                    "已紧急停止所有浏览器会话",
+                    "Browser control emergency stopped",
+                    2200,
+                );
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
+
         let Some(fence) = self.computer_fence() else {
             return;
         };
@@ -522,6 +636,9 @@ impl AppShell {
                 path: path.clone(),
                 max_bytes: Some(64 * 1024),
             },
+            WorkbenchCommand::LaunchManagedChromium | WorkbenchCommand::BrowserEmergencyStop => {
+                return;
+            }
         };
 
         let caller_label = self
@@ -624,6 +741,8 @@ impl AppShell {
                                         wb.status_banner = Some(out.stderr.clone());
                                     }
                                 }
+                                WorkbenchCommand::LaunchManagedChromium
+                                | WorkbenchCommand::BrowserEmergencyStop => {}
                             }
                             wcx.notify();
                         });
@@ -715,8 +834,115 @@ impl AppShell {
                 }
                 true
             }
+            InspectorAction::SetBotBrowserPolicy { bot_id, policy } => {
+                global_desktop_browser_bridge().set_run_policy(policy);
+                let resolved_bot = if bot_id > 0 {
+                    Some(bot_id)
+                } else {
+                    fallback_bot_id
+                }
+                .unwrap_or(777000);
+                self.persist_bot_browser_policy(resolved_bot, policy, cx);
+                true
+            }
+            InspectorAction::LaunchManagedChromiumCdp => {
+                let client = self.client.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let res = run_on_tokio(&client, async move {
+                        global_desktop_browser_bridge().launch_managed_chromium().await
+                    })
+                    .await
+                    .and_then(|inner| inner);
+                    let _ = weak.update(app, |shell, cx| {
+                        match res {
+                            Ok(cdp_url) => {
+                                shell.window_runtime.enqueue_toast(
+                                    format!("Managed Chromium CDP ready: {cdp_url}"),
+                                    2500,
+                                );
+                            }
+                            Err(e) => {
+                                shell.window_runtime.enqueue_toast(
+                                    format!("Managed Chromium launch failed: {e}"),
+                                    2800,
+                                );
+                            }
+                        }
+                        shell.sync_computers_to_views(cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+                true
+            }
+            InspectorAction::TriggerBrowserEmergencyStop { bot_id } => {
+                global_desktop_browser_bridge().trigger_emergency_stop(Some(
+                    "Emergency stop triggered from Bot Inspector".to_string(),
+                ));
+                let resolved_bot = if bot_id > 0 {
+                    Some(bot_id)
+                } else {
+                    fallback_bot_id
+                }
+                .unwrap_or(777000);
+                self.persist_bot_browser_policy(resolved_bot, BrowserRunPolicy::Disabled, cx);
+                self.enqueue_computer_toast(
+                    "已紧急停止该智能体与本地浏览器会话",
+                    "Browser automation emergency stopped",
+                    2400,
+                );
+                true
+            }
             _ => false,
         }
+    }
+
+    fn persist_bot_browser_policy(
+        &mut self,
+        bot_id: u64,
+        policy: BrowserRunPolicy,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_computers_to_views(cx);
+        let Some(fence) = self.computer_fence() else {
+            return;
+        };
+        let client = self.client.clone();
+        let req = UpdateBotBrowserProfileRequest {
+            enabled: Some(policy != BrowserRunPolicy::Disabled),
+            run_policy: Some(policy),
+            ..Default::default()
+        };
+        cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+            let c = client.clone();
+            let res = run_on_tokio(&client, async move {
+                c.update_bot_browser_profile_async(bot_id, &req)
+                    .await
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .and_then(|inner| inner);
+            let _ = weak.update(app, |shell, cx| {
+                if !shell.computer_fence_matches(fence) {
+                    return;
+                }
+                if let Ok(profile) = res {
+                    shell
+                        .computers
+                        .bot_browser_profiles
+                        .insert(bot_id, profile.clone());
+                    if shell.effective_inspector_bot_id(cx) == Some(bot_id) {
+                        shell.inspector.update(cx, |insp, icx| {
+                            insp.sync_bot_browser_profile(Some(profile));
+                            icx.notify();
+                        });
+                    }
+                    shell.sync_computers_to_views(cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn persist_bot_computer_profile(
@@ -1083,6 +1309,93 @@ impl AppShell {
                     });
                 })
                 .detach();
+            }
+            SettingsComputersEvent::CopyBrowserToken(token) => {
+                let tok = if token.trim().is_empty() {
+                    global_desktop_browser_bridge().pairing_token()
+                } else {
+                    token.clone()
+                };
+                if !tok.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(tok));
+                    self.enqueue_computer_toast(
+                        "已复制浏览器桥接配对令牌",
+                        "Browser pairing token copied to clipboard",
+                        2000,
+                    );
+                }
+                cx.notify();
+            }
+            SettingsComputersEvent::RotateBrowserToken => {
+                match global_desktop_browser_bridge().rotate_pairing_token() {
+                    Ok(new_tok) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(new_tok));
+                        self.sync_computers_to_views(cx);
+                        self.enqueue_computer_toast(
+                            "已轮换并复制新配对令牌",
+                            "Rotated & copied new browser pairing token",
+                            2200,
+                        );
+                    }
+                    Err(e) => {
+                        self.window_runtime.enqueue_toast(
+                            format!("Token rotation failed: {e}"),
+                            2600,
+                        );
+                    }
+                }
+                cx.notify();
+            }
+            SettingsComputersEvent::SetBrowserPolicy(policy) => {
+                global_desktop_browser_bridge().set_run_policy(*policy);
+                let target_bot = self.effective_inspector_bot_id(cx).unwrap_or(777000);
+                self.persist_bot_browser_policy(target_bot, *policy, cx);
+                self.window_runtime.enqueue_toast(
+                    format!("Browser policy: {}", policy.as_str()),
+                    1800,
+                );
+                cx.notify();
+            }
+            SettingsComputersEvent::LaunchManagedChromium => {
+                let client = self.client.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let res = run_on_tokio(&client, async move {
+                        global_desktop_browser_bridge().launch_managed_chromium().await
+                    })
+                    .await
+                    .and_then(|inner| inner);
+                    let _ = weak.update(app, |shell, cx| {
+                        let msg = match res {
+                            Ok(url) => format!("Managed Chromium CDP ready: {url}"),
+                            Err(e) => format!("Managed Chromium launch failed: {e}"),
+                        };
+                        if let Some(sc_ent) =
+                            shell.settings_router.read(cx).settings_computers.clone()
+                        {
+                            sc_ent.update(cx, |sc, sc_cx| {
+                                sc.status_message = Some(msg.clone());
+                                sc_cx.notify();
+                            });
+                        }
+                        shell.window_runtime.enqueue_toast(msg, 2600);
+                        shell.sync_computers_to_views(cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            SettingsComputersEvent::BrowserEmergencyStop => {
+                global_desktop_browser_bridge().trigger_emergency_stop(Some(
+                    "Emergency stop triggered from Settings::Computers".to_string(),
+                ));
+                let target_bot = self.effective_inspector_bot_id(cx).unwrap_or(777000);
+                self.persist_bot_browser_policy(target_bot, BrowserRunPolicy::Disabled, cx);
+                self.enqueue_computer_toast(
+                    "已紧急停止所有浏览器自动化会话",
+                    "Browser automation emergency stop activated",
+                    2400,
+                );
+                cx.notify();
             }
         }
     }

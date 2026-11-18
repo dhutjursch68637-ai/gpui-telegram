@@ -1,5 +1,6 @@
 pub mod api_acp;
 pub mod api_auth;
+pub mod api_browser;
 pub mod api_chats;
 pub mod api_computers;
 pub mod api_e2ee;
@@ -18,6 +19,13 @@ pub use proxy::{ClientProxyConfig, ClientProxyType, ProxyHealthReport};
 
 pub use api_computers::{
     detect_local_host_info, detect_local_hostname, detect_real_lan_ips, execute_local_computer_op,
+};
+pub use gpui_telegram_proto::browser_contracts::{
+    BotBrowserProfileDto, BrowserApprovalDecisionDto, BrowserBridgeHostKind,
+    BrowserBridgeStatusDto, BrowserCallerKind, BrowserCommandRequest, BrowserCommandResult,
+    BrowserPairingAction, BrowserPairingDto, BrowserPairingRequest, BrowserPreferredTarget,
+    BrowserRpcErrorCode, BrowserRunPolicy, BrowserSessionDto, BrowserTabDto,
+    BrowserTabsListResponse, PendingBrowserCommandDto, UpdateBotBrowserProfileRequest,
 };
 pub use gpui_telegram_proto::tailnet_contracts::{
     DerpClientFrame, DerpServerFrame, DiscoPayload, PeerApiFrame, TailnetEndpoint,

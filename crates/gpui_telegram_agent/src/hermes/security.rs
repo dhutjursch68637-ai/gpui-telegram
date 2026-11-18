@@ -842,6 +842,22 @@ pub struct InjectionScanResult {
 /// returning a redacted copy (`sanitized_text`) with API keys and `.env` secrets scrubbed.
 pub fn scan_content_for_injection(text: &str) -> InjectionScanResult {
     let lower = text.to_ascii_lowercase();
+    let normalized_lower: String = lower
+        .chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200B}'
+                    | '\u{200C}'
+                    | '\u{200D}'
+                    | '\u{FEFF}'
+                    | '\u{2060}'
+                    | '\u{00AD}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .collect();
     let mut findings = Vec::new();
 
     const INJECTION_SIGNATURES: &[(&str, &str, InjectionSeverity, &str)] = &[
@@ -906,6 +922,12 @@ pub fn scan_content_for_injection(text: &str) -> InjectionScanResult {
             "Prompt injection instructing model to exfiltrate .env secrets",
         ),
         (
+            "ssh_key_exfil",
+            "/.ssh/id_rsa",
+            InjectionSeverity::High,
+            "Prompt injection attempting SSH private key exfiltration",
+        ),
+        (
             "reveal_system_prompt",
             "reveal your system prompt",
             InjectionSeverity::Medium,
@@ -930,6 +952,13 @@ pub fn scan_content_for_injection(text: &str) -> InjectionScanResult {
                 description: (*desc).into(),
                 matched_excerpt: excerpt,
             });
+        } else if normalized_lower.contains(needle) {
+            findings.push(InjectionFinding {
+                rule_id: (*rule_id).into(),
+                severity: *severity,
+                description: (*desc).into(),
+                matched_excerpt: (*needle).into(),
+            });
         }
     }
 
@@ -937,7 +966,12 @@ pub fn scan_content_for_injection(text: &str) -> InjectionScanResult {
     let bidi_or_zero_width = text.chars().filter(|&c| {
         matches!(
             c,
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}' | '\u{200C}' | '\u{200D}'
+            '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200B}'
+                | '\u{200C}'
+                | '\u{200D}'
+                | '\u{FEFF}'
         )
     }).count();
     if bidi_or_zero_width >= 3 {
@@ -1324,6 +1358,17 @@ pub fn check_tool_invocation_reasonableness(
                 policy.max_argument_bytes
             ),
         };
+    }
+
+    // Browser tools operate on remote/sandboxed browser DOM & URLs rather than host filesystem paths:
+    // enforce canonical forbidden host-path key rejection instead of workspace path checks.
+    if tool_name.starts_with("browser_") || tool_name == "browser.cdp_send" {
+        if let Err(err) =
+            gpui_telegram_proto::browser_contracts::validate_browser_tool_arguments(args)
+        {
+            return TirVerdict::Block { reason: err };
+        }
+        return TirVerdict::Allow;
     }
 
     // Check file/dir path parameters

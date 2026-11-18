@@ -380,7 +380,10 @@ impl AppShell {
             | InspectorAction::OpenComputerDetailInSettings { .. }
             | InspectorAction::OpenCreateCloudComputerModal { .. }
             | InspectorAction::BindBotToComputer { .. }
-            | InspectorAction::SaveBotComputerConfig { .. }) => {
+            | InspectorAction::SaveBotComputerConfig { .. }
+            | InspectorAction::SetBotBrowserPolicy { .. }
+            | InspectorAction::LaunchManagedChromiumCdp
+            | InspectorAction::TriggerBrowserEmergencyStop { .. }) => {
                 let _ = self.handle_computer_inspector_action(act, cx);
             }
             InspectorAction::PatchFabushiBot { bot_id, req } => {

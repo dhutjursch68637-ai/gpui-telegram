@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{AppContext, AsyncApp, Context, WeakEntity};
+use gpui::{AsyncApp, ClipboardItem, Context, WeakEntity};
 use gpui_telegram_client::net::hermes_client::{
     HermesApprovalDecisionRequest, HermesCommandRequest, HermesCreateKanbanBoardRequest,
     HermesCreateKanbanCardRequest, HermesHonchoRequest, HermesMemoryMutationRequest,
@@ -11,8 +11,10 @@ use gpui_telegram_client::net::hermes_client::{
     HermesUpdateToolsetsRequest,
 };
 use gpui_telegram_client::TelegramClient;
+use gpui_telegram_proto::browser_contracts::{BrowserRunPolicy, UpdateBotBrowserProfileRequest};
 use serde_json::json;
 
+use crate::browser_bridge::global_desktop_browser_bridge;
 use crate::components::tool_permission_dock::ToolApprovalDecision;
 use crate::i18n::tr_str;
 use crate::views::app_shell::shell_actions::{
@@ -193,6 +195,7 @@ impl AppShell {
                     if let Some(sess) = sessions_res { w.sync_sessions(sess); }
                     if let Some(prov) = providers_res { w.sync_providers(prov); }
                     if let Some(usage) = usage_res { w.sync_usage_summary(usage); }
+                    w.sync_browser_bridge(global_desktop_browser_bridge().snapshot());
                     w.set_loading(false, None);
                     w_cx.notify();
                 });
@@ -785,6 +788,149 @@ impl AppShell {
             }
             TasksWorkspaceAction::ProbeMagpieProvider(pid) => {
                 self.run_magpie_probe(pid, None, cx);
+            }
+            TasksWorkspaceAction::CopyBrowserPairingToken(tok) => {
+                let actual = if tok.trim().is_empty() {
+                    global_desktop_browser_bridge().pairing_token()
+                } else {
+                    tok
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(actual));
+                let msg = tr_str(
+                    self.active_lang_id(),
+                    "已复制浏览器桥接配对码",
+                    "Browser bridge pairing token copied",
+                )
+                .to_string();
+                self.window_runtime.enqueue_toast(msg, 2200);
+                cx.notify();
+            }
+            TasksWorkspaceAction::RotateBrowserPairingToken => {
+                match global_desktop_browser_bridge().rotate_pairing_token() {
+                    Ok(new_tok) => {
+                        cx.write_to_clipboard(ClipboardItem::new_string(new_tok));
+                        self.sync_computers_to_views(cx);
+                        let msg = tr_str(
+                            self.active_lang_id(),
+                            "已轮换并复制新浏览器配对码",
+                            "Rotated & copied new browser pairing token",
+                        )
+                        .to_string();
+                        self.window_runtime.enqueue_toast(msg, 2400);
+                    }
+                    Err(e) => {
+                        self.window_runtime
+                            .enqueue_toast(format!("Rotate token failed: {e}"), 2600);
+                    }
+                }
+                cx.notify();
+            }
+            TasksWorkspaceAction::SetBrowserRunPolicy(policy) => {
+                global_desktop_browser_bridge().set_run_policy(policy);
+                self.sync_computers_to_views(cx);
+                let bot_target = active_bot_id.unwrap_or(777000);
+                if self.is_authenticated {
+                    let c = client.clone();
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        let patch = UpdateBotBrowserProfileRequest {
+                            enabled: Some(policy != BrowserRunPolicy::Disabled),
+                            run_policy: Some(policy),
+                            ..Default::default()
+                        };
+                        let _ = c
+                            .runtime()
+                            .spawn({
+                                let c2 = c.clone();
+                                async move {
+                                    c2.update_bot_browser_profile_async(bot_target, &patch)
+                                        .await
+                                }
+                            })
+                            .await;
+                        let _ = weak.update(app, |s, cx| {
+                            s.sync_computers_to_views(cx);
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                self.window_runtime.enqueue_toast(
+                    format!("Browser policy: {}", policy.as_str()),
+                    2000,
+                );
+                cx.notify();
+            }
+            TasksWorkspaceAction::LaunchManagedChromiumCdp => {
+                let rt_client = client.clone();
+                cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                    let launch_res = rt_client
+                        .runtime()
+                        .spawn(async move {
+                            global_desktop_browser_bridge().launch_managed_chromium().await
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r);
+                    let _ = weak.update(app, |s, cx| {
+                        match launch_res {
+                            Ok(cdp_url) => {
+                                s.window_runtime.enqueue_toast(
+                                    format!("Managed Chromium CDP ready: {cdp_url}"),
+                                    2600,
+                                );
+                            }
+                            Err(e) => {
+                                s.window_runtime.enqueue_toast(
+                                    format!("Managed Chromium launch failed: {e}"),
+                                    2800,
+                                );
+                            }
+                        }
+                        s.sync_computers_to_views(cx);
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            TasksWorkspaceAction::TriggerBrowserEmergencyStop => {
+                global_desktop_browser_bridge().trigger_emergency_stop(Some(
+                    "Emergency stop triggered from Desktop UI".to_string(),
+                ));
+                self.sync_computers_to_views(cx);
+                let bot_target = active_bot_id.unwrap_or(777000);
+                if self.is_authenticated {
+                    let c = client.clone();
+                    cx.spawn(async move |weak: WeakEntity<Self>, app: &mut AsyncApp| {
+                        let patch = UpdateBotBrowserProfileRequest {
+                            enabled: Some(false),
+                            run_policy: Some(BrowserRunPolicy::Disabled),
+                            ..Default::default()
+                        };
+                        let _ = c
+                            .runtime()
+                            .spawn({
+                                let c2 = c.clone();
+                                async move {
+                                    c2.update_bot_browser_profile_async(bot_target, &patch)
+                                        .await
+                                }
+                            })
+                            .await;
+                        let _ = weak.update(app, |s, cx| {
+                            s.sync_computers_to_views(cx);
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                }
+                let msg = tr_str(
+                    self.active_lang_id(),
+                    "已紧急停止所有浏览器自动化会话",
+                    "Browser control emergency stop activated",
+                )
+                .to_string();
+                self.window_runtime.enqueue_toast(msg, 2600);
+                cx.notify();
             }
         }
     }

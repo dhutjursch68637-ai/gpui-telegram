@@ -4,6 +4,7 @@ pub mod analytics_wallet;
 pub mod auth_advanced;
 pub mod auth_factors;
 pub mod bots_miniapps;
+pub mod browser_bridge;
 pub mod chat_extras;
 pub mod chat_lifecycle;
 pub mod computers;

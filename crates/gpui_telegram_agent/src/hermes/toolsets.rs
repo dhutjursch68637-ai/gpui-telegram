@@ -886,6 +886,7 @@ pub struct HermesToolContext {
     pub mcp_registry: Arc<RwLock<McpRegistry>>,
     pub computer_broker: Arc<Mutex<ComputerLeaseBroker>>,
     pub computer_provider: Option<Arc<dyn ComputerCloudProvider>>,
+    pub browser_provider: Option<Arc<dyn super::browser_bridge::BrowserBridgeProvider>>,
     pub talk_coordinator: Arc<Mutex<TalkCoordinator>>,
     pub todos: Arc<Mutex<TodoStore>>,
     pub agentic_store: Arc<Mutex<LocalAgenticStore>>,
@@ -926,6 +927,7 @@ impl HermesToolContext {
             mcp_registry: Arc::new(RwLock::new(McpRegistry::new())),
             computer_broker: Arc::new(Mutex::new(ComputerLeaseBroker::new())),
             computer_provider: None,
+            browser_provider: None,
             talk_coordinator: Arc::new(Mutex::new(TalkCoordinator::new())),
             todos: Arc::new(Mutex::new(TodoStore::new())),
             agentic_store: Arc::new(Mutex::new(LocalAgenticStore::new())),
@@ -960,6 +962,14 @@ impl HermesToolContext {
 
     pub fn with_computer_provider(mut self, provider: Arc<dyn ComputerCloudProvider>) -> Self {
         self.computer_provider = Some(provider);
+        self
+    }
+
+    pub fn with_browser_provider(
+        mut self,
+        provider: Arc<dyn super::browser_bridge::BrowserBridgeProvider>,
+    ) -> Self {
+        self.browser_provider = Some(provider);
         self
     }
 
@@ -1052,7 +1062,7 @@ impl HermesToolContext {
 
 /// Complete catalog of all 58 Hermes tools across all 28 toolsets.
 pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
-    vec![
+    let mut specs = vec![
         // 1. Core (3)
         HermesToolSpec::new(
             "toolset_list",
@@ -1373,83 +1383,6 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
                 "required": ["url"]
             }),
             ToolRiskLevel::Low,
-            true,
-        ),
-        HermesToolSpec::new(
-            "browser_navigate",
-            ToolsetId::Browser,
-            "Navigate a Chrome DevTools Protocol (CDP) browser tab to a URL.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string" },
-                    "cdp_url": { "type": "string" }
-                },
-                "required": ["url"]
-            }),
-            ToolRiskLevel::Medium,
-            false,
-        ),
-        HermesToolSpec::new(
-            "browser_snapshot",
-            ToolsetId::Browser,
-            "Capture DOM accessibility/text snapshot of the active CDP browser tab.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "cdp_url": { "type": "string" },
-                    "selector": { "type": "string" }
-                }
-            }),
-            ToolRiskLevel::ReadOnly,
-            true,
-        ),
-        HermesToolSpec::new(
-            "browser_click",
-            ToolsetId::Browser,
-            "Click an element by CSS selector or coordinates in the active CDP browser tab.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "selector": { "type": "string" },
-                    "x": { "type": "number" },
-                    "y": { "type": "number" },
-                    "cdp_url": { "type": "string" }
-                }
-            }),
-            ToolRiskLevel::Medium,
-            false,
-        ),
-        HermesToolSpec::new(
-            "browser_type",
-            ToolsetId::Browser,
-            "Type text into a focused or selected element in the active CDP browser tab.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "text": { "type": "string" },
-                    "selector": { "type": "string" },
-                    "submit": { "type": "boolean" },
-                    "cdp_url": { "type": "string" }
-                },
-                "required": ["text"]
-            }),
-            ToolRiskLevel::Medium,
-            false,
-        ),
-        HermesToolSpec::new(
-            "browser_screenshot",
-            ToolsetId::Browser,
-            "Capture a PNG screenshot of the active CDP browser tab.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "full_page": { "type": "boolean" },
-                    "output_path": { "type": "string" },
-                    "cdp_url": { "type": "string" }
-                }
-            }),
-            ToolRiskLevel::ReadOnly,
             true,
         ),
         // 6. Audio, Voice, Vision, ImageGen, VideoGen (6)
@@ -2480,11 +2413,43 @@ pub fn all_builtin_tool_specs() -> Vec<HermesToolSpec> {
             ToolRiskLevel::Medium,
             false,
         ),
-    ]
+    ];
+
+    specs.extend(
+        gpui_telegram_proto::browser_contracts::canonical_browser_tool_descriptors()
+            .into_iter()
+            .map(browser_descriptor_to_tool_spec),
+    );
+    specs
+}
+
+fn browser_descriptor_to_tool_spec(
+    desc: gpui_telegram_proto::browser_contracts::BrowserToolDescriptor,
+) -> HermesToolSpec {
+    use gpui_telegram_proto::browser_contracts::BrowserPolicyRisk;
+    let (risk_level, read_only) = match desc.risk {
+        BrowserPolicyRisk::ReadOnly => (ToolRiskLevel::ReadOnly, true),
+        BrowserPolicyRisk::Mutating => (ToolRiskLevel::Medium, false),
+        BrowserPolicyRisk::HighRisk => (ToolRiskLevel::High, false),
+    };
+    HermesToolSpec::new(
+        desc.name,
+        ToolsetId::Browser,
+        desc.description,
+        desc.parameters_schema,
+        risk_level,
+        read_only,
+    )
 }
 
 pub fn find_tool_spec(name: &str) -> Option<HermesToolSpec> {
-    all_builtin_tool_specs().into_iter().find(|s| s.name == name)
+    if let Some(spec) = all_builtin_tool_specs().into_iter().find(|s| s.name == name) {
+        return Some(spec);
+    }
+    let parsed = gpui_telegram_proto::browser_contracts::BrowserToolName::parse(name)?;
+    let mut spec = browser_descriptor_to_tool_spec(parsed.descriptor());
+    spec.name = name.trim().to_string();
+    Some(spec)
 }
 
 /// Central tool dispatch engine enforcing enablement, cancellation, TIR checks, and routing.

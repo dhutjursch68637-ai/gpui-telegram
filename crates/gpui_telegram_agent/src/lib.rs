@@ -23,6 +23,13 @@ pub use computer::{
     ComputerCloudProvider, ComputerControlLease, ComputerLeaseBroker, CuaAction, CuaExecutor,
     LeaseState,
 };
+pub use hermes::browser_bridge::{
+    canonicalize_browser_tool_name, to_browser_injection_dto, validate_navigable_browser_url,
+    BrowserBoxFuture, BrowserBridgeProvider,
+};
+pub use hermes::browser_cdp::{
+    global_cdp_manager, parse_image_dimensions_from_b64, CdpBrowserManager,
+};
 pub use hermes::commands::{
     CommandDescriptor, CommandExecutionOutcome, CommandUiEffect, InlineActionButton,
     SlashCommandParser, SlashCommandRegistry,

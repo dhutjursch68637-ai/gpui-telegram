@@ -4,25 +4,26 @@ use crate::config::ClientConfig;
 use crate::e2ee::{E2eeManager, E2eeStore};
 use crate::media_transfer::{ChunkedTransferManager, FileTransferStore};
 use crate::net::{
-    AuthResponse, BotComputerProfileDto, ClientProxyConfig, ComputerListResponse, ComputerNodeDto,
-    ConnectionStatus,
-    HermesApprovalDecisionRequest, HermesApprovalDto, HermesCallInviteRequest,
-    HermesCallInviteResponse, HermesClient, HermesCommandDescriptor, HermesCommandRequest,
-    HermesCommandResponse, HermesCreateKanbanBoardRequest, HermesCreateKanbanCardRequest,
-    HermesCronJobDto, HermesHeartbeatConfigDto, HermesHonchoRequest, HermesHonchoStateDto,
-    HermesKanbanBoardDto, HermesKanbanCardDto, HermesMemoryMutationRequest, HermesMemoryStateDto,
-    HermesMoveKanbanCardRequest, HermesProviderConfigDto, HermesRichChatDto, HermesRichMessageDto,
-    HermesRollbackRequest, HermesRollbackResponse, HermesSaveCronRequest,
+    AuthResponse, BotBrowserProfileDto, BotComputerProfileDto, BrowserApprovalDecisionDto,
+    BrowserBridgeStatusDto, BrowserCommandRequest, BrowserCommandResult, BrowserPairingDto,
+    BrowserPairingRequest, BrowserTabsListResponse, ClientProxyConfig, ComputerListResponse,
+    ComputerNodeDto, ConnectionStatus, HermesApprovalDecisionRequest, HermesApprovalDto,
+    HermesCallInviteRequest, HermesCallInviteResponse, HermesClient, HermesCommandDescriptor,
+    HermesCommandRequest, HermesCommandResponse, HermesCreateKanbanBoardRequest,
+    HermesCreateKanbanCardRequest, HermesCronJobDto, HermesHeartbeatConfigDto, HermesHonchoRequest,
+    HermesHonchoStateDto, HermesKanbanBoardDto, HermesKanbanCardDto, HermesMemoryMutationRequest,
+    HermesMemoryStateDto, HermesMoveKanbanCardRequest, HermesProviderConfigDto, HermesRichChatDto,
+    HermesRichMessageDto, HermesRollbackRequest, HermesRollbackResponse, HermesSaveCronRequest,
     HermesSaveProviderRequest, HermesSaveSkillRequest, HermesSessionBranchRequest,
     HermesSessionDetailDto, HermesSessionDto, HermesSessionExportResponse,
     HermesSessionSearchRequest, HermesSkillDto, HermesSoulDto, HermesStatusDto,
     HermesTalkTurnRequest, HermesTalkTurnResponse, HermesTerminalProcessDto, HermesToolsetDto,
     HermesTurnRequest, HermesTurnResponse, HermesUpdateToolsetsRequest, HermesUsageSummaryDto,
-    HttpClient, HttpClientError, OpenAiChatCompletionsRequest, PendingComputerCommandDto,
-    RegisterLocalComputerRequest, RemoteComputerCommandRequest, RemoteComputerCommandResult,
-    RemoteComputerOp, TailnetEngine, TailnetIdentity, TailnetNetMap, TailnetNodeStatus,
-    UpdateBotComputerRequest, UpdateComputerPolicyRequest, UpsertCloudComputerRequest, WsChannel,
-    WsTransport,
+    HttpClient, HttpClientError, OpenAiChatCompletionsRequest, PendingBrowserCommandDto,
+    PendingComputerCommandDto, RegisterLocalComputerRequest, RemoteComputerCommandRequest,
+    RemoteComputerCommandResult, RemoteComputerOp, TailnetEngine, TailnetIdentity, TailnetNetMap,
+    TailnetNodeStatus, UpdateBotBrowserProfileRequest, UpdateBotComputerRequest,
+    UpdateComputerPolicyRequest, UpsertCloudComputerRequest, WsChannel, WsTransport,
 };
 use crate::outbox::{NetworkState, NetworkStatusListener, OutboxStore, OutboxWorker, TokenProvider};
 use crate::sync::ClientSyncCoordinator;
@@ -1186,6 +1187,153 @@ impl TelegramClient {
         Ok(self
             .http_client
             .update_bot_computer_profile(&token, bot_id, req)
+            .await?)
+    }
+
+    pub fn get_browser_status(&self, bot_id: Option<u64>) -> Result<BrowserBridgeStatusDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.get_browser_status(&token, bot_id).await })
+    }
+
+    pub async fn get_browser_status_async(
+        &self,
+        bot_id: Option<u64>,
+    ) -> Result<BrowserBridgeStatusDto> {
+        let token = self.require_token()?;
+        Ok(self.http_client.get_browser_status(&token, bot_id).await?)
+    }
+
+    pub fn list_browser_tabs(&self) -> Result<BrowserTabsListResponse> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.list_browser_tabs(&token).await })
+    }
+
+    pub async fn list_browser_tabs_async(&self) -> Result<BrowserTabsListResponse> {
+        let token = self.require_token()?;
+        Ok(self.http_client.list_browser_tabs(&token).await?)
+    }
+
+    pub fn exec_browser_command(
+        &self,
+        req: &BrowserCommandRequest,
+    ) -> Result<BrowserCommandResult> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.exec_browser_command(&token, req).await })
+    }
+
+    pub async fn exec_browser_command_async(
+        &self,
+        req: &BrowserCommandRequest,
+    ) -> Result<BrowserCommandResult> {
+        let token = self.require_token()?;
+        Ok(self.http_client.exec_browser_command(&token, req).await?)
+    }
+
+    pub fn get_bot_browser_profile(&self, bot_id: u64) -> Result<BotBrowserProfileDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.get_bot_browser_profile(&token, bot_id).await })
+    }
+
+    pub async fn get_bot_browser_profile_async(
+        &self,
+        bot_id: u64,
+    ) -> Result<BotBrowserProfileDto> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .get_bot_browser_profile(&token, bot_id)
+            .await?)
+    }
+
+    pub fn update_bot_browser_profile(
+        &self,
+        bot_id: u64,
+        req: &UpdateBotBrowserProfileRequest,
+    ) -> Result<BotBrowserProfileDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.update_bot_browser_profile(&token, bot_id, req).await })
+    }
+
+    pub async fn update_bot_browser_profile_async(
+        &self,
+        bot_id: u64,
+        req: &UpdateBotBrowserProfileRequest,
+    ) -> Result<BotBrowserProfileDto> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .update_bot_browser_profile(&token, bot_id, req)
+            .await?)
+    }
+
+    pub fn list_pending_browser_commands(&self) -> Result<Vec<PendingBrowserCommandDto>> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.list_pending_browser_commands(&token).await })
+    }
+
+    pub async fn list_pending_browser_commands_async(
+        &self,
+    ) -> Result<Vec<PendingBrowserCommandDto>> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .list_pending_browser_commands(&token)
+            .await?)
+    }
+
+    pub fn approve_browser_command(
+        &self,
+        command_id: &str,
+        req: &BrowserApprovalDecisionDto,
+    ) -> Result<PendingBrowserCommandDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.approve_browser_command(&token, command_id, req).await })
+    }
+
+    pub async fn approve_browser_command_async(
+        &self,
+        command_id: &str,
+        req: &BrowserApprovalDecisionDto,
+    ) -> Result<PendingBrowserCommandDto> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .approve_browser_command(&token, command_id, req)
+            .await?)
+    }
+
+    pub fn manage_browser_pairing(&self, req: &BrowserPairingRequest) -> Result<BrowserPairingDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.manage_browser_pairing(&token, req).await })
+    }
+
+    pub async fn manage_browser_pairing_async(
+        &self,
+        req: &BrowserPairingRequest,
+    ) -> Result<BrowserPairingDto> {
+        let token = self.require_token()?;
+        Ok(self.http_client.manage_browser_pairing(&token, req).await?)
+    }
+
+    pub fn get_or_create_browser_pairing(&self) -> Result<BrowserPairingDto> {
+        let token = self.require_token()?;
+        let http = self.http_client.clone();
+        self.block_on_http(async move { http.get_or_create_browser_pairing(&token).await })
+    }
+
+    pub async fn get_or_create_browser_pairing_async(&self) -> Result<BrowserPairingDto> {
+        let token = self.require_token()?;
+        Ok(self
+            .http_client
+            .get_or_create_browser_pairing(&token)
             .await?)
     }
 }

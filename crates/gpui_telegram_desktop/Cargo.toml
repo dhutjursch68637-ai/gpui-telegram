@@ -27,9 +27,14 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 tokio = { workspace = true }
+axum = { workspace = true }
+tokio-tungstenite = { workspace = true }
+async-trait = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
+getrandom = { workspace = true }
+tracing = { workspace = true }
 qrcode = { version = "0.14.1", default-features = false }
 fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
 mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }

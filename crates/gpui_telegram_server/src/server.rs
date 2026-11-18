@@ -80,6 +80,7 @@ pub struct AppState {
     pub fabushi_bots: Arc<gpui_telegram_agent::fabushi_bot::FabushiBotHost>,
     pub self_weak: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>>,
     pub computers: Arc<crate::routes::computers::ComputerControlService>,
+    pub browser: Arc<crate::routes::browser_bridge::BrowserControlService>,
     pub tailnet: Arc<crate::routes::tailnet::TailnetCoordService>,
     pub task_registry: Arc<tokio::sync::RwLock<HashMap<String, gpui_telegram_agent::tasks::TaskFsm>>>,
     pub approval_gates: Arc<tokio::sync::RwLock<HashMap<String, gpui_telegram_agent::tasks::ApprovalGate>>>,
@@ -150,16 +151,19 @@ impl AppState {
 
         let workspace_root = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let hermes_data_dir = if config.is_in_memory() {
+        let base_data_dir = if config.is_in_memory() {
             None
+        } else if let Some(ref d) = config.data_dir {
+            Some(std::path::PathBuf::from(d))
         } else {
             let db_path = std::path::PathBuf::from(config.resolve_db_path());
             let parent = db_path
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| std::path::Path::new("."));
-            Some(parent.join("hermes"))
+            Some(parent.to_path_buf())
         };
+        let hermes_data_dir = base_data_dir.as_ref().map(|p| p.join("hermes"));
         let hermes_cfg = gpui_telegram_agent::hermes::HermesEngineConfig {
             workspace_root,
             data_dir: hermes_data_dir,
@@ -176,24 +180,18 @@ impl AppState {
         let computers = Arc::new(crate::routes::computers::ComputerControlService::new(
             db.clone(),
         ));
+        let browser = Arc::new(crate::routes::browser_bridge::BrowserControlService::new(
+            db.clone(),
+        ));
         let tailnet = Arc::new(crate::routes::tailnet::TailnetCoordService::new(
             db.clone(),
         ));
         computers.set_tailnet_service(tailnet.clone());
         hermes.set_computer_provider(computers.clone());
+        hermes.set_browser_provider(browser.clone());
 
-        let fabushi_bots = if config.is_in_memory() {
-            Arc::new(
-                gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_ephemeral(hermes.clone())
-                    .expect("Failed to initialize ephemeral FabushiBotHost"),
-            )
-        } else {
-            let db_path = std::path::PathBuf::from(config.resolve_db_path());
-            let parent = db_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            let agents_dir = parent.join("fabushi_agents");
+        let fabushi_bots = if let Some(ref base_dir) = base_data_dir {
+            let agents_dir = base_dir.join("fabushi_agents");
             Arc::new(
                 gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_with_dir(
                     agents_dir,
@@ -201,8 +199,14 @@ impl AppState {
                 )
                 .expect("Failed to initialize FabushiBotHost"),
             )
+        } else {
+            Arc::new(
+                gpui_telegram_agent::fabushi_bot::FabushiBotHost::new_ephemeral(hermes.clone())
+                    .expect("Failed to initialize ephemeral FabushiBotHost"),
+            )
         };
         fabushi_bots.set_computer_provider(computers.clone());
+        fabushi_bots.set_browser_provider(browser.clone());
         let self_weak: Arc<std::sync::OnceLock<std::sync::Weak<AppState>>> =
             Arc::new(std::sync::OnceLock::new());
 
@@ -529,6 +533,7 @@ impl AppState {
             fabushi_bots,
             self_weak,
             computers,
+            browser,
             tailnet,
             task_registry,
             approval_gates,
@@ -555,6 +560,7 @@ impl AppState {
 
     pub fn shutdown(&self) {
         self.gateway_hub.shutdown();
+        self.browser.shutdown();
     }
 
     fn open_database(config: &ServerConfig) -> crate::db::ServerDatabase {
@@ -1028,6 +1034,41 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
             "/api/v1/computer-agent/exec",
             post(routes::computers::computer_agent_exec)
                 .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        // --- Browser Control Relay (Extension & Desktop WS + AuthBearer REST + Bot Profiles) ---
+        .route(
+            "/api/v1/browser/ws",
+            get(routes::browser_bridge::browser_ws_handler),
+        )
+        .route(
+            "/api/v1/browser/status",
+            get(routes::browser_bridge::browser_status_get),
+        )
+        .route(
+            "/api/v1/browser/tabs",
+            get(routes::browser_bridge::browser_tabs_get),
+        )
+        .route(
+            "/api/v1/browser/exec",
+            post(routes::browser_bridge::browser_exec_post)
+                .layer(axum::extract::DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
+        .route(
+            "/api/v1/bots/{bot_id}/browser",
+            get(routes::browser_bridge::bot_browser_profile_get)
+                .put(routes::browser_bridge::bot_browser_profile_put),
+        )
+        .route(
+            "/api/v1/browser/commands/pending",
+            get(routes::browser_bridge::browser_commands_pending_get),
+        )
+        .route(
+            "/api/v1/browser/commands/{command_id}/approve",
+            post(routes::browser_bridge::browser_command_approve_post),
+        )
+        .route(
+            "/api/v1/browser/pairing",
+            post(routes::browser_bridge::browser_pairing_post),
         )
         // --- Tailscale-style Mesh Coordination, STUN & Built-in DERP WebSocket ---
         .route(

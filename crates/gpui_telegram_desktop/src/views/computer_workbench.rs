@@ -6,6 +6,7 @@ use gpui_telegram_proto::{
     ComputerNodeDto, ComputerNodeKind, ComputerRunPolicy, TailnetPeerLiveState, TailnetRelayMode,
 };
 
+use crate::browser_bridge::{global_desktop_browser_bridge, DesktopBrowserBridgeSnapshot};
 use crate::components::ui::TextInputController;
 use crate::i18n::tr_str;
 use crate::theme::assets::{IconName, tg_icon};
@@ -47,6 +48,8 @@ pub enum WorkbenchCommand {
     RunShell { command: String, cwd: Option<String> },
     ListFiles { path: String },
     ReadRemoteFile { path: String },
+    LaunchManagedChromium,
+    BrowserEmergencyStop,
 }
 
 /// Decodes an inline `data:image/<fmt>;base64,...` frame URL into a cached GPUI `Image`.
@@ -214,6 +217,7 @@ pub struct ComputerWorkbench {
     pub status_banner: Option<String>,
     pub pending_command: Option<WorkbenchCommand>,
     pub tailnet_peer: Option<TailnetPeerLiveState>,
+    pub browser_bridge: DesktopBrowserBridgeSnapshot,
     cached_frame_src: Option<String>,
     cached_frame_image: Option<Arc<gpui::Image>>,
 }
@@ -254,9 +258,14 @@ impl ComputerWorkbench {
             status_banner: None,
             pending_command: None,
             tailnet_peer: None,
+            browser_bridge: global_desktop_browser_bridge().snapshot(),
             cached_frame_src: None,
             cached_frame_image: None,
         }
+    }
+
+    pub fn sync_browser_bridge(&mut self, snap: DesktopBrowserBridgeSnapshot) {
+        self.browser_bridge = snap;
     }
 
     pub fn new_live(device_name: String, palette: TdesktopThemePalette, language_id: &str) -> Self {
@@ -1303,6 +1312,53 @@ impl Render for ComputerWorkbench {
                                                                 .child(format!("{mode_label} · E2E")),
                                                         ),
                                                 )
+                                            })
+                                            .child({
+                                                let br = &self.browser_bridge;
+                                                let (br_color, br_text) = if br.emergency_stopped {
+                                                    (
+                                                        pal.danger,
+                                                        tr_str(&lang, "浏览器已急停", "Browser Stopped")
+                                                            .to_string(),
+                                                    )
+                                                } else if br.extension_connected {
+                                                    (
+                                                        pal.success,
+                                                        format!(
+                                                            "{} · {} tabs",
+                                                            tr_str(&lang, "插件已连接", "Ext Live"),
+                                                            br.active_tabs
+                                                        ),
+                                                    )
+                                                } else if br.local_cdp_available {
+                                                    (
+                                                        pal.accent,
+                                                        tr_str(&lang, "本地 CDP 就绪", "Local CDP")
+                                                            .to_string(),
+                                                    )
+                                                } else {
+                                                    (
+                                                        pal.text_secondary,
+                                                        format!(
+                                                            "{} :{}",
+                                                            tr_str(&lang, "浏览器桥接", "Bridge"),
+                                                            br.port
+                                                        ),
+                                                    )
+                                                };
+                                                div()
+                                                    .id("wb-browser-bridge-pill")
+                                                    .px(px(6.0))
+                                                    .py(px(1.0))
+                                                    .rounded(px(999.0))
+                                                    .bg(TdesktopThemePalette::rgba_with_alpha(
+                                                        br_color,
+                                                        0.14,
+                                                    ))
+                                                    .text_size(px(10.5))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(br_color))
+                                                    .child(br_text)
                                             }),
                                     )
                                     .child(
@@ -1341,6 +1397,43 @@ impl Render for ComputerWorkbench {
                                     cx.notify();
                                 }),
                             ))
+                            .child(Self::quick_cmd_btn(
+                                "wb-launch-chromium-cdp",
+                                tr_str(&lang, "启动 Chromium", "Chromium CDP"),
+                                self.browser_bridge.local_cdp_available,
+                                &pal,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_command =
+                                        Some(WorkbenchCommand::LaunchManagedChromium);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .id("wb-browser-stop-btn")
+                                    .cursor_pointer()
+                                    .px(px(8.0))
+                                    .py(px(4.0))
+                                    .rounded(px(6.0))
+                                    .bg(TdesktopThemePalette::rgba_with_alpha(pal.danger, 0.16))
+                                    .border_1()
+                                    .border_color(TdesktopThemePalette::rgba_with_alpha(
+                                        pal.danger,
+                                        0.38,
+                                    ))
+                                    .text_xs()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(pal.danger))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.pending_command =
+                                                Some(WorkbenchCommand::BrowserEmergencyStop);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child(tr_str(&lang, "浏览器急停", "Stop Browser")),
+                            )
                             .child(
                                 Self::toggle_chip(
                                     tr_str(&lang, "鼠标", "Mouse"),

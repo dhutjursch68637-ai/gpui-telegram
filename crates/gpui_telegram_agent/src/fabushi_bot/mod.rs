@@ -234,6 +234,7 @@ pub struct FabushiBotHost {
     _ephemeral_dir: Option<TempDir>,
     host_hermes: Arc<HermesEngine>,
     computer_provider: RwLock<Option<Arc<dyn ComputerCloudProvider>>>,
+    browser_provider: RwLock<Option<Arc<dyn crate::hermes::browser_bridge::BrowserBridgeProvider>>>,
     teammate_handler: RwLock<Option<Arc<dyn FabushiTeammateHandler>>>,
     platform_im_bridge: RwLock<Option<Arc<dyn PlatformImBridge>>>,
     agentic_backend: RwLock<Option<Arc<dyn AgenticStateBackend>>>,
@@ -255,6 +256,7 @@ impl FabushiBotHost {
             _ephemeral_dir: None,
             host_hermes,
             computer_provider: RwLock::new(None),
+            browser_provider: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -275,6 +277,7 @@ impl FabushiBotHost {
             _ephemeral_dir: Some(temp_dir),
             host_hermes,
             computer_provider: RwLock::new(None),
+            browser_provider: RwLock::new(None),
             teammate_handler: RwLock::new(None),
             platform_im_bridge: RwLock::new(None),
             agentic_backend: RwLock::new(None),
@@ -296,6 +299,21 @@ impl FabushiBotHost {
         if let Ok(instances) = self.instances.read() {
             for inst in instances.values() {
                 inst.hermes.set_computer_provider(Arc::clone(&provider));
+            }
+        }
+    }
+
+    pub fn set_browser_provider(
+        &self,
+        provider: Arc<dyn crate::hermes::browser_bridge::BrowserBridgeProvider>,
+    ) {
+        if let Ok(mut guard) = self.browser_provider.write() {
+            *guard = Some(Arc::clone(&provider));
+        }
+        self.host_hermes.set_browser_provider(Arc::clone(&provider));
+        if let Ok(instances) = self.instances.read() {
+            for inst in instances.values() {
+                inst.hermes.set_browser_provider(Arc::clone(&provider));
             }
         }
     }
@@ -572,6 +590,15 @@ impl FabushiBotHost {
             existing
                 .hermes
                 .sync_providers_from(self.host_hermes.providers());
+            if let Some(provider) = self
+                .browser_provider
+                .read()
+                .ok()
+                .and_then(|g| g.clone())
+                .or_else(|| self.host_hermes.browser_provider())
+            {
+                existing.hermes.set_browser_provider(provider);
+            }
             let prof_snap = existing.profile();
             self.register_in_core_registry(
                 spec.bot_user_id,
@@ -708,6 +735,16 @@ impl FabushiBotHost {
             bot_hermes.set_computer_provider(provider);
         } else if let Some(provider) = self.host_hermes.computer_provider() {
             bot_hermes.set_computer_provider(provider);
+        }
+        if let Some(provider) = self
+            .browser_provider
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+        {
+            bot_hermes.set_browser_provider(provider);
+        } else if let Some(provider) = self.host_hermes.browser_provider() {
+            bot_hermes.set_browser_provider(provider);
         }
         if let Some(handler) = self.teammate_handler.read().ok().and_then(|g| g.clone()) {
             bot_hermes.set_teammate_handler(handler);

@@ -37,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let state_for_shutdown = Arc::clone(&state);
     let app = build_router_with_state(state);
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let addr = format!("{}:{}", config.host, config.port)
+        .parse::<SocketAddr>()
+        .or_else(|_| format!("[{}]:{}", config.host, config.port).parse::<SocketAddr>())
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], config.port)));
 
     info!("Starting gpui_telegram_server listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;

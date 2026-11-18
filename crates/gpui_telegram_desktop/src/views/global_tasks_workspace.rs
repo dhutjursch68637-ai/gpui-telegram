@@ -8,11 +8,13 @@ use gpui_telegram_client::net::hermes_client::{
     HermesUsageSummaryDto, MagpieStateDto,
 };
 
+use crate::browser_bridge::{global_desktop_browser_bridge, DesktopBrowserBridgeSnapshot};
 use crate::components::tool_permission_dock::{PendingToolApproval, ToolApprovalDecision};
 use crate::i18n::tr_str;
 use crate::theme::assets::{tg_icon, IconName};
 use crate::theme::palette::{TdesktopThemeMode, TdesktopThemePalette};
 use crate::views::hermes_studio_panels;
+use gpui_telegram_proto::browser_contracts::BrowserRunPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TasksWorkspaceTab {
@@ -160,6 +162,11 @@ pub enum TasksWorkspaceAction {
     OpenAiProvidersSettings,
     ScanMagpieSubscriptions,
     ProbeMagpieProvider(String),
+    CopyBrowserPairingToken(String),
+    RotateBrowserPairingToken,
+    SetBrowserRunPolicy(BrowserRunPolicy),
+    LaunchManagedChromiumCdp,
+    TriggerBrowserEmergencyStop,
 }
 
 pub fn default_28_hermes_toolsets() -> Vec<HermesToolsetDto> {
@@ -173,7 +180,7 @@ pub fn default_28_hermes_toolsets() -> Vec<HermesToolsetDto> {
         ("vision", "Image understanding & OCR analysis", "safe", true),
         ("image_gen", "Text-to-image synthesis", "safe", false),
         ("video_gen", "Video synthesis & clipping", "safe", false),
-        ("browser", "CDP browser navigation & snapshots", "caution", false),
+        ("browser", "24-tool Extension Relay & CDP Browser Control", "caution", false),
         ("audio_tts", "Text-to-speech WAV synthesis", "safe", true),
         ("audio_stt", "Speech-to-text transcription", "safe", true),
         ("cronjob", "Cron routines & scheduled prompts", "caution", true),
@@ -263,6 +270,7 @@ pub struct GlobalTasksWorkspace {
     pub active_api_mode: String,
     pub fallback_chain_draft: String,
     pub usage_summary: HermesUsageSummaryDto,
+    pub browser_bridge: DesktopBrowserBridgeSnapshot,
 }
 
 impl GlobalTasksWorkspace {
@@ -343,7 +351,12 @@ impl GlobalTasksWorkspace {
             active_api_mode: "local_hermes".to_string(),
             fallback_chain_draft: "local_hermes -> openai -> anthropic".to_string(),
             usage_summary: HermesUsageSummaryDto::default(),
+            browser_bridge: global_desktop_browser_bridge().snapshot(),
         }
+    }
+
+    pub fn sync_browser_bridge(&mut self, snap: DesktopBrowserBridgeSnapshot) {
+        self.browser_bridge = snap;
     }
 
     pub fn new_live(palette: TdesktopThemePalette, language_id: &str) -> Self {

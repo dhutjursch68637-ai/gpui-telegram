@@ -124,6 +124,14 @@ pub enum InspectorAction {
     OpenAddBotToGroup(u64),
     ReportBot(u64),
     ToggleBlockBot(u64),
+    SetBotBrowserPolicy {
+        bot_id: u64,
+        policy: gpui_telegram_proto::browser_contracts::BrowserRunPolicy,
+    },
+    LaunchManagedChromiumCdp,
+    TriggerBrowserEmergencyStop {
+        bot_id: u64,
+    },
 }
 
 pub struct ProfileTabModel {

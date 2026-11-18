@@ -6,6 +6,8 @@ pub struct ServerConfig {
     pub port: u16,
     pub database_url: String,
     pub media_storage_path: String,
+    #[serde(default)]
+    pub data_dir: Option<String>,
     pub session_timeout_secs: u64,
     pub ws_heartbeat_interval_secs: u64,
     pub ws_inactivity_timeout_secs: u64,
@@ -24,6 +26,7 @@ impl Default for ServerConfig {
             port: 8080,
             database_url: ":memory:".into(),
             media_storage_path: "data/media".into(),
+            data_dir: None,
             session_timeout_secs: 30 * 24 * 3600, // 30 days
             ws_heartbeat_interval_secs: 30,
             ws_inactivity_timeout_secs: 60,
@@ -83,8 +86,8 @@ impl ServerConfig {
     }
 
     /// Read server configuration from environment variables with sensible defaults.
-    /// When DATABASE_URL is unset, defaults to physical storage "sqlite://data/gpui_telegram.db"
-    /// for production and standalone daemon execution.
+    /// When DATABASE_URL and GPUI_TELEGRAM_DB_PATH are unset, defaults to physical storage
+    /// "sqlite://data/gpui_telegram.db" for production and standalone daemon execution.
     pub fn from_env() -> Self {
         let mut config = Self::default();
         if let Ok(host) = std::env::var("HOST") {
@@ -98,10 +101,47 @@ impl ServerConfig {
                 config.port = port;
             }
         }
+        if let Ok(bind_addr) = std::env::var("GPUI_TELEGRAM_BIND_ADDR") {
+            let trimmed = bind_addr.trim();
+            if !trimmed.is_empty() {
+                if let Ok(sock) = trimmed.parse::<std::net::SocketAddr>() {
+                    config.host = sock.ip().to_string();
+                    config.port = sock.port();
+                } else if let Some((h, p)) = trimmed.rsplit_once(':') {
+                    if let Ok(port) = p.trim().parse::<u16>() {
+                        let host_clean = h.trim().trim_start_matches('[').trim_end_matches(']');
+                        if !host_clean.is_empty() {
+                            config.host = host_clean.to_string();
+                        }
+                        config.port = port;
+                    }
+                }
+            }
+        }
+
+        let data_dir = std::env::var("GPUI_TELEGRAM_DATA_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        config.data_dir = data_dir.clone();
+
         let db_url = std::env::var("DATABASE_URL")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            .or_else(|| {
+                std::env::var("GPUI_TELEGRAM_DB_PATH")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .map(|p| {
+                        if p == ":memory:" || p.starts_with("sqlite:") {
+                            p
+                        } else {
+                            format!("sqlite://{p}")
+                        }
+                    })
+            })
             .unwrap_or_else(|| "sqlite://data/gpui_telegram.db".into());
         config.database_url = db_url;
 
@@ -110,7 +150,10 @@ impl ServerConfig {
             if !media_trimmed.is_empty() {
                 config.media_storage_path = media_trimmed.to_string();
             }
+        } else if let Some(ref d) = data_dir {
+            config.media_storage_path = format!("{}/media", d.trim_end_matches('/'));
         }
+
         if let Ok(model) = std::env::var("DEFAULT_AGENT_MODEL") {
             let model_trimmed = model.trim();
             if !model_trimmed.is_empty() {
@@ -163,8 +206,10 @@ mod tests {
     fn test_server_config_from_env_defaults_to_disk() {
         let _lock = ENV_LOCK.lock().unwrap();
         let old_val = std::env::var("DATABASE_URL").ok();
+        let old_db_path = std::env::var("GPUI_TELEGRAM_DB_PATH").ok();
         unsafe {
             std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("GPUI_TELEGRAM_DB_PATH");
         }
 
         let config = ServerConfig::from_env();
@@ -175,6 +220,11 @@ mod tests {
         if let Some(v) = old_val {
             unsafe {
                 std::env::set_var("DATABASE_URL", v);
+            }
+        }
+        if let Some(v) = old_db_path {
+            unsafe {
+                std::env::set_var("GPUI_TELEGRAM_DB_PATH", v);
             }
         }
     }
@@ -199,6 +249,55 @@ mod tests {
         } else {
             unsafe {
                 std::env::remove_var("DATABASE_URL");
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_config_gpui_env_vars() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let old_db_url = std::env::var("DATABASE_URL").ok();
+        let old_db_path = std::env::var("GPUI_TELEGRAM_DB_PATH").ok();
+        let old_bind = std::env::var("GPUI_TELEGRAM_BIND_ADDR").ok();
+        let old_data = std::env::var("GPUI_TELEGRAM_DATA_DIR").ok();
+        let old_media = std::env::var("MEDIA_STORAGE_PATH").ok();
+
+        unsafe {
+            std::env::remove_var("DATABASE_URL");
+            std::env::remove_var("MEDIA_STORAGE_PATH");
+            std::env::set_var("GPUI_TELEGRAM_BIND_ADDR", "127.0.0.1:19876");
+            std::env::set_var("GPUI_TELEGRAM_DB_PATH", "/tmp/test_gpui.db");
+            std::env::set_var("GPUI_TELEGRAM_DATA_DIR", "/tmp/test_gpui_data");
+        }
+
+        let cfg = ServerConfig::from_env();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 19876);
+        assert_eq!(cfg.database_url, "sqlite:///tmp/test_gpui.db");
+        assert_eq!(cfg.resolve_db_path(), "/tmp/test_gpui.db");
+        assert_eq!(cfg.data_dir.as_deref(), Some("/tmp/test_gpui_data"));
+        assert_eq!(cfg.media_storage_path, "/tmp/test_gpui_data/media");
+
+        unsafe {
+            match old_db_url {
+                Some(v) => std::env::set_var("DATABASE_URL", v),
+                None => std::env::remove_var("DATABASE_URL"),
+            }
+            match old_db_path {
+                Some(v) => std::env::set_var("GPUI_TELEGRAM_DB_PATH", v),
+                None => std::env::remove_var("GPUI_TELEGRAM_DB_PATH"),
+            }
+            match old_bind {
+                Some(v) => std::env::set_var("GPUI_TELEGRAM_BIND_ADDR", v),
+                None => std::env::remove_var("GPUI_TELEGRAM_BIND_ADDR"),
+            }
+            match old_data {
+                Some(v) => std::env::set_var("GPUI_TELEGRAM_DATA_DIR", v),
+                None => std::env::remove_var("GPUI_TELEGRAM_DATA_DIR"),
+            }
+            match old_media {
+                Some(v) => std::env::set_var("MEDIA_STORAGE_PATH", v),
+                None => std::env::remove_var("MEDIA_STORAGE_PATH"),
             }
         }
     }

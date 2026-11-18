@@ -875,6 +875,25 @@ pub(crate) fn build_enriched_bot_turn_context(
         prompt_blocks.push(comp_lines.join("\n"));
     }
 
+    let browser_status = state.browser.build_status_for_user(user_id, bot_id);
+    if browser_status.connected || browser_status.local_cdp_available {
+        let tabs = state.browser.list_tabs_for_user(user_id);
+        let mut br_lines = vec![format!(
+            "## Live Browser Bridge Inventory\n- mode=`{}` | connected={} | policy=`{}` | active_tabs={}",
+            browser_status.mode,
+            browser_status.connected,
+            browser_status.run_policy.as_str(),
+            tabs.len()
+        )];
+        for tab in tabs.iter().take(15) {
+            br_lines.push(format!(
+                "- tab_id=`{}` | active={} | controllable={} | title=\"{}\" | url=`{}`",
+                tab.tab_id, tab.active, tab.controllable, tab.title, tab.url
+            ));
+        }
+        prompt_blocks.push(br_lines.join("\n"));
+    }
+
     for sec in extra_sections {
         let trimmed = sec.trim();
         if !trimmed.is_empty() {
@@ -2160,7 +2179,11 @@ pub async fn hermes_turns_create(
     system_prompt = enriched_sp;
     model = effective_model;
 
-    let yolo_mode = payload.get("yolo_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+    let yolo_mode = payload
+        .get("yolo_mode")
+        .or_else(|| payload.get("yolo"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if let Some(bid_num) = bot_id_u64 {
         if let Ok((sid, _)) = resolve_and_apply_bot_session_policy(
             &state,
@@ -2177,11 +2200,19 @@ pub async fn hermes_turns_create(
             }
         }
     } else if yolo_mode {
-        if let Some(ref sid) = session_id {
-            if let Ok(mut sec) = engine.security().write() {
-                sec.approvals
-                    .set_session_mode(sid.clone(), ApprovalMode::Yolo);
+        let sid = match session_id.clone() {
+            Some(existing) => existing,
+            None => {
+                let created = engine
+                    .resolve_or_create_session(None, chat_id, None, "api", model.as_deref())
+                    .map(|s| s.id)
+                    .unwrap_or_else(|_| format!("sess_{}", uuid::Uuid::new_v4().simple()));
+                session_id = Some(created.clone());
+                created
             }
+        };
+        if let Ok(mut sec) = engine.security().write() {
+            sec.approvals.set_session_mode(sid, ApprovalMode::Yolo);
         }
     }
 
@@ -2348,8 +2379,18 @@ pub async fn hermes_command_run(
     let bot_id = parse_optional_bot_id(payload.get("bot_id"))
         .or_else(|| bot_id_u64.map(|n| n.to_string()));
     let engine = resolve_hermes_for_bot(&state, bot_id_u64);
+    let user_id_str = auth.user_id.0.to_string();
 
-    match engine.execute_command(session_id, chat_id, bot_id.as_deref(), &command) {
+    match engine
+        .execute_command_async(
+            session_id,
+            chat_id,
+            bot_id.as_deref(),
+            Some(&user_id_str),
+            &command,
+        )
+        .await
+    {
         Ok((resolved_sid, outcome)) => (
             StatusCode::OK,
             Json(json!({
@@ -5134,6 +5175,8 @@ mod tests {
             duration_ms: 145,
             inline_buttons: Vec::new(),
             ui_actions: Vec::new(),
+            artifact: None,
+            artifacts: Vec::new(),
         });
         sc.apply_event(HermesEvent::TextDelta {
             text: "服务器运行正常。".into(),

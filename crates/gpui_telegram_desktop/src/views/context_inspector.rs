@@ -1,5 +1,6 @@
 //! ContextInspectorDrawer 320px Right Drawer (`SPEC-02-GPUI-COMPONENT-HIERARCHY` § 2.5).
 
+use crate::browser_bridge::{global_desktop_browser_bridge, DesktopBrowserBridgeSnapshot};
 use crate::components::ui::{TextInputController, delete_prev_word, pop_last_char};
 use crate::i18n::tr_str;
 use crate::theme::assets::{IconName, tg_icon};
@@ -14,6 +15,7 @@ use crate::views::drawer::inspector_tabs::*;
 use crate::views::drawer::statistics::info_statistics_inner_widget::ChartDataPoint;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use gpui_telegram_proto::browser_contracts::BotBrowserProfileDto;
 use gpui_telegram_proto::{BotComputerProfileDto, ComputerNodeDto, ComputerRunPolicy};
 
 pub const DRAWER_WIDTH: f32 = 320.0;
@@ -45,6 +47,8 @@ pub struct ContextInspector {
     pub language_id: String,
     pub computers: Vec<ComputerNodeDto>,
     pub bot_computer_profile: Option<BotComputerProfileDto>,
+    pub bot_browser_profile: Option<BotBrowserProfileDto>,
+    pub browser_bridge: DesktopBrowserBridgeSnapshot,
     pub bot_config_focus: BotConfigFocusField,
     pub bot_draft_persona: String,
     pub bot_draft_model: String,
@@ -80,6 +84,8 @@ impl ContextInspector {
             language_id: "en".to_string(),
             computers: Vec::new(),
             bot_computer_profile: None,
+            bot_browser_profile: None,
+            browser_bridge: global_desktop_browser_bridge().snapshot(),
             bot_config_focus: BotConfigFocusField::None,
             bot_draft_persona: String::new(),
             bot_draft_model: String::new(),
@@ -287,6 +293,14 @@ impl ContextInspector {
 
     pub fn sync_computers(&mut self, computers: Vec<ComputerNodeDto>) {
         self.computers = computers;
+    }
+
+    pub fn sync_browser_bridge(&mut self, snap: DesktopBrowserBridgeSnapshot) {
+        self.browser_bridge = snap;
+    }
+
+    pub fn sync_bot_browser_profile(&mut self, profile: Option<BotBrowserProfileDto>) {
+        self.bot_browser_profile = profile;
     }
 
     pub fn sync_bot_computer_profile(&mut self, profile: Option<BotComputerProfileDto>) {

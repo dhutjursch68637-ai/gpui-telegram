@@ -894,7 +894,7 @@ impl SlashCommandRegistry {
         self.add("voice", &[], "/voice [on|off|tts <text>]", ModesAndUi, "Toggle voice mode or synthesize speech preview", true);
         self.add("talk", &[], "/talk", ModesAndUi, "Launch live AI Talk Mode voice conversation", false);
         self.add("computer", &["cua"], "/computer", ModesAndUi, "Open Remote Computer Use workbench", false);
-        self.add("browser", &[], "/browser [url|snapshot|status]", ModesAndUi, "Control or toggle CDP browser automation", true);
+        self.add("browser", &[], "/browser [status|tabs|open <url>|navigate <url>|snapshot|cdp <url>|on|off|policy <mode>|stop]", ModesAndUi, "Control Extension/Desktop browser relay, CDP endpoint, tabs, snapshots, and BrowserRunPolicy", true);
         self.add("verbose", &[], "/verbose [on|off]", ModesAndUi, "Toggle verbose tool output streaming", true);
         self.add("reasoning", &["think"], "/reasoning [on|off|budget <tokens>]", ModesAndUi, "Toggle or adjust model thinking/reasoning visibility", true);
         self.add("debug", &[], "/debug [on|off]", ModesAndUi, "Toggle runtime debug trace output", true);
@@ -1582,7 +1582,9 @@ impl SlashCommandRegistry {
                 url: None,
             }]]),
 
-            "voice" | "browser" | "verbose" | "reasoning" | "debug" => {
+            "browser" => exec_browser_sync(parsed, host),
+
+            "voice" | "verbose" | "reasoning" | "debug" => {
                 match host.set_toggle(&canonical, first_arg) {
                     Ok(msg) => {
                         let mutated = canonical.clone();
@@ -1676,6 +1678,157 @@ impl SlashCommandRegistry {
                 url: None,
             },
         ]])
+    }
+}
+
+pub const BROWSER_COMMAND_USAGE: &str = "Usage: `/browser [status|tabs|open <url>|navigate <url>|snapshot|cdp <url>|on|off|policy <mode>|stop]`";
+
+pub fn parse_browser_run_policy_arg(
+    raw: &str,
+) -> Option<gpui_telegram_proto::browser_contracts::BrowserRunPolicy> {
+    use gpui_telegram_proto::browser_contracts::BrowserRunPolicy;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ask_every_time" | "ask" | "prompt" | "askeverytime" => Some(BrowserRunPolicy::AskEveryTime),
+        "allow_read_only" | "read_only" | "readonly" | "allowreadonly" => {
+            Some(BrowserRunPolicy::AllowReadOnly)
+        }
+        "always_allow_authorized"
+        | "always_allow"
+        | "always"
+        | "allow"
+        | "yolo"
+        | "alwaysallowauthorized" => Some(BrowserRunPolicy::AlwaysAllowAuthorized),
+        "disabled" | "disable" | "off" | "deny" | "none" => Some(BrowserRunPolicy::Disabled),
+        _ => None,
+    }
+}
+
+fn exec_browser_sync(
+    parsed: &ParsedSlashCommand,
+    host: &mut dyn CommandHost,
+) -> CommandExecutionOutcome {
+    let sub = parsed.argv.first().map(|s| s.trim());
+    match sub {
+        None | Some("") | Some("status") => CommandExecutionOutcome::ok(
+            "browser",
+            format!(
+                "Browser Control (`ToolsetId::Browser` — 24+ tools): session `{}`. {}",
+                host.active_session_id(),
+                BROWSER_COMMAND_USAGE
+            ),
+        ),
+        Some("tabs") | Some("list") => CommandExecutionOutcome::ok(
+            "browser",
+            "Browser tabs: query active session via `/browser tabs` or `browser_list_tabs`.",
+        ),
+        Some("snapshot") | Some("snap") => CommandExecutionOutcome::ok(
+            "browser",
+            "Browser snapshot: capture interactive `[ref=eN]` DOM snapshot via `/browser snapshot` or `browser_snapshot`.",
+        ),
+        Some("on") | Some("enable") | Some("true") | Some("1") => {
+            let _ = host.set_toggle("browser", Some("on"));
+            CommandExecutionOutcome::ok(
+                "browser",
+                "Browser automation enabled (`ToolsetId::Browser` active).",
+            )
+            .with_mutated(vec!["browser".into(), "toolsets".into()])
+        }
+        Some("off") | Some("disable") | Some("false") | Some("0") => {
+            let _ = host.set_toggle("browser", Some("off"));
+            CommandExecutionOutcome::ok(
+                "browser",
+                "Browser automation disabled for this session.",
+            )
+            .with_mutated(vec!["browser".into(), "toolsets".into()])
+        }
+        Some("stop") | Some("kill") | Some("emergency-stop") | Some("emergency_stop") => {
+            let _ = host.set_toggle("browser", Some("off"));
+            let _ = host.config_action("set", Some("browser_run_policy"), Some("disabled"));
+            CommandExecutionOutcome::ok(
+                "browser",
+                "Emergency browser stop engaged: browser control disabled and active tabs detached.",
+            )
+            .with_mutated(vec!["browser".into(), "browser_run_policy".into()])
+        }
+        Some("open") | Some("navigate") | Some("goto") => {
+            let Some(raw_url) = parsed.argv.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                return CommandExecutionOutcome::err(
+                    "browser",
+                    format!("Missing URL argument. {BROWSER_COMMAND_USAGE}"),
+                );
+            };
+            match super::browser_bridge::validate_navigable_browser_url(raw_url, true) {
+                Ok(safe_url) => CommandExecutionOutcome::ok(
+                    "browser",
+                    format!("Browser navigation target validated: `{safe_url}`"),
+                )
+                .with_mutated(vec!["browser".into()]),
+                Err((code, msg)) => CommandExecutionOutcome::err(
+                    "browser",
+                    format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                ),
+            }
+        }
+        Some("cdp") => {
+            let Some(raw_cdp) = parsed.argv.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                return CommandExecutionOutcome::err(
+                    "browser",
+                    format!("Missing CDP endpoint URL. {BROWSER_COMMAND_USAGE}"),
+                );
+            };
+            let Some(normalized) = super::browser_cdp::CdpBrowserManager::normalize_cdp_http_base(raw_cdp) else {
+                return CommandExecutionOutcome::err(
+                    "browser",
+                    format!("Invalid CDP endpoint `{raw_cdp}`. Expected `http://host:port` or `ws://host:port/...`."),
+                );
+            };
+            let _ = host.config_action("set", Some("browser_cdp_url"), Some(&normalized));
+            let _ = host.set_toggle("browser", Some("on"));
+            CommandExecutionOutcome::ok(
+                "browser",
+                format!("Configured session CDP endpoint: `{normalized}`."),
+            )
+            .with_mutated(vec!["browser_cdp_url".into(), "browser".into()])
+        }
+        Some("policy") => {
+            let Some(raw_mode) = parsed.argv.get(1).map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                return CommandExecutionOutcome::err(
+                    "browser",
+                    "Usage: `/browser policy <ask_every_time|allow_read_only|always_allow_authorized|disabled>`",
+                );
+            };
+            let Some(policy) = parse_browser_run_policy_arg(raw_mode) else {
+                return CommandExecutionOutcome::err(
+                    "browser",
+                    format!(
+                        "Unknown browser policy `{raw_mode}`. Valid policies: `ask_every_time`, `allow_read_only`, `always_allow_authorized`, `disabled`."
+                    ),
+                );
+            };
+            let _ = host.config_action("set", Some("browser_run_policy"), Some(policy.as_str()));
+            CommandExecutionOutcome::ok(
+                "browser",
+                format!("BrowserRunPolicy updated to `{}`.", policy.as_str()),
+            )
+            .with_mutated(vec!["browser_run_policy".into()])
+        }
+        Some(other) if other.contains("://") || other.starts_with("about:") || other.starts_with("javascript:") || other.starts_with("data:") => {
+            match super::browser_bridge::validate_navigable_browser_url(other, true) {
+                Ok(safe_url) => CommandExecutionOutcome::ok(
+                    "browser",
+                    format!("Browser navigation target validated: `{safe_url}`"),
+                )
+                .with_mutated(vec!["browser".into()]),
+                Err((code, msg)) => CommandExecutionOutcome::err(
+                    "browser",
+                    format!("{} ({}): {}", code.as_str(), code.code(), msg),
+                ),
+            }
+        }
+        Some(unknown) => CommandExecutionOutcome::err(
+            "browser",
+            format!("Unknown `/browser` subcommand `{unknown}`. {BROWSER_COMMAND_USAGE}"),
+        ),
     }
 }
 

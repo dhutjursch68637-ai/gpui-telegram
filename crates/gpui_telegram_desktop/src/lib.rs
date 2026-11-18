@@ -21,3 +21,4 @@ pub mod window;
 pub use window::*;
 
 pub mod settings_premium;
+pub mod browser_bridge;
